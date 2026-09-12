@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+TRACKER.md
+NOTES.md
+plan.md
+.cortex/
+data/synthetic/*.csv
+data/processed/*.csv
