@@ -1,8 +1,10 @@
-# Canonical schema contract — v3
+# Canonical schema contract — v4
 
 Versioned reference for `VIGIL.CORE`'s tables, written **before** the DDL exists (per `architecture.md`'s market-agnostic design rule #4), not consolidated from scattered comments afterward. Any DDL change must be reflected here in the same change, not after the fact.
 
 **v3 fixes a batch of structural gaps a review pass found in v2** — every fix below is numbered `[FIX #n]` and traced to a specific finding, same discipline as `Praman`'s `plug_and_play_architecture_v2.md`. v2's `JURISDICTION_ID`/`VENUE_ID` split itself was correct and is unchanged; the gaps were one level down — in what got calibrated, how positions derive, what best execution compares, who can write, and two undefined identifier spaces.
+
+**v4 fixes one more gap v3 introduced but didn't fully solve:** `VENUES.STATUS` (`active`/`discontinued`) has no date, and a discontinued venue genuinely has real historical trades that must stay representable — `STATUS` alone can't distinguish "this venue has no future trades past its closure" from "this venue never happened." Fixed with `ACTIVE_FROM`/`DISCONTINUED_AT` date columns. Also upgrades `CBOJ` from corroborated-but-unverified to primary-source confirmed (Cboe's own July 2025 press release, found via Wayback Machine after the live IR page blocked a direct fetch) and adds a second venue, `CBOJBIDS`, the same source surfaced. See the "First jurisdiction: Japan" table and change log below for specifics.
 
 ## [FIX #1] `CURRENCY` was already in this file but missing from `architecture.md`'s prose
 
@@ -74,14 +76,16 @@ PK: `JURISDICTION_ID`.
 ### `VENUES`
 | Column | Type | Notes |
 |---|---|---|
-| `VENUE_ID` | VARCHAR | e.g. `XTKS` (TSE), `XOSE` (Osaka Exchange), `TOCOM`, `JPNX` (Japannext PTS), `ODX`, `ODXST`. |
+| `VENUE_ID` | VARCHAR | e.g. `XTKS` (TSE), `XOSE` (Osaka Exchange), `TOCOM`, `JPNX` (Japannext PTS), `ODX`, `ODXST`, `CBOJ` (Cboe Japan PTS, discontinued), `CBOJBIDS` (Cboe BIDS Japan, discontinued). |
 | `JURISDICTION_ID` | VARCHAR NOT NULL | FK → `JURISDICTIONS`. |
 | `VENUE_NAME` | VARCHAR | |
-| `VENUE_TYPE` | VARCHAR | `exchange` / `pts` / `otc_facility`. |
+| `VENUE_TYPE` | VARCHAR | `exchange` / `pts` / `otc_facility` / `block_trading`. |
 | `OPERATOR_NAME` | VARCHAR | |
-| `STATUS` | VARCHAR NOT NULL DEFAULT 'active' | `active` / `discontinued`. Exists because venues genuinely stop operating (see Cboe Japan note below) — a discontinued venue's historical rows stay queryable, it's just not a target for new synthetic/live data. |
+| `STATUS` | VARCHAR NOT NULL DEFAULT 'active' | `active` / `discontinued`. |
+| `ACTIVE_FROM` | DATE | Nullable when the venue's founding date isn't confirmed — do not guess a placeholder date. |
+| `DISCONTINUED_AT` | DATE | **New — `STATUS` alone can't support historical data for a closed venue.** A synthetic generator or live adaptor must never produce `ORDERS`/`TRADES` for a venue dated after this value; a query reasoning about "was this venue open at trade time" checks the trade's timestamp against this range, not just today's `STATUS`. NULL while `STATUS = 'active'`. This is the fix for a real gap: a `STATUS` flag alone would either wrongly exclude a discontinued venue's real historical trades, or wrongly allow new trades to be generated for it past its actual closure — a date range is required, not optional. |
 
-PK: `VENUE_ID`. A jurisdiction has many venues (verified for Japan: 3 JPX Group exchanges + 2 PTS operators outside the group, one further PTS confirmed discontinued — see below) — this table's whole reason to exist.
+PK: `VENUE_ID`. A jurisdiction has many venues, including ones that later stop operating — verified for Japan: 3 JPX Group exchanges + 2 active PTS operators outside the group + 2 further venues (Cboe Japan PTS and Cboe BIDS Japan) confirmed discontinued but with real historical trade data to represent — see below. This table's whole reason to exist includes carrying that history correctly, not just listing who's currently open.
 
 ### `BENEFICIAL_OWNERS` — new, per Fix #8
 | Column | Type | Notes |
@@ -262,15 +266,18 @@ Append-only — a recalibration inserts a new row, never updates one.
 
 Verified live against each operator's own site before writing this contract, not assumed:
 
-| `VENUE_ID` | Name | Type | Status | Confirmed |
-|---|---|---|---|---|
-| `XTKS` | Tokyo Stock Exchange | exchange | active | Yes — JPX Group site |
-| `XOSE` | Osaka Exchange | exchange | active | Yes — JPX Group site |
-| `TOCOM` | Tokyo Commodity Exchange | exchange | active | Yes — JPX Group site (listed as a distinct link on JPX's own homepage; whether its derivatives book has since been operationally folded into `XOSE` needs one more check before finalizing granularity) |
-| `JPNX` | Japannext PTS | pts | active | Yes — Japannext's own site (X-Market/U-Market segments, Night Market session, published FIX/ITCH/OUCH specs) |
-| `ODX` | Osaka Digital Exchange | pts | active | Yes — ODX's own site, self-described as "the third PTS in Japan" for equities |
-| `ODXST` | ODX START (security tokens) | pts | active | Yes — same ODX source; a genuinely different instrument class (security tokens, not equities), kept as its own `VENUE_ID` rather than folded into `ODX` |
-| `CBOJ` | Cboe Japan (formerly Chi-X Japan) | pts | **discontinued — do not seed as active** | User-confirmed it stopped trading in Japan in 2025; independently corroborated by Cboe's own site listing no Japan/Asia region under "Global Markets" (checked this session). Not a primary-sourced citation (no dated closure announcement located directly) — corroborated from two independent angles, not zero-confidence, but not the same confidence tier as the six directly-confirmed-active venues above. If seeded at all, seed with `STATUS = 'discontinued'` for historical-data completeness only, never as a live target for new synthetic/ingested data. |
+| `VENUE_ID` | Name | Type | Status | `ACTIVE_FROM` / `DISCONTINUED_AT` | Confirmed |
+|---|---|---|---|---|---|
+| `XTKS` | Tokyo Stock Exchange | exchange | active | unconfirmed / — | Yes — JPX Group site |
+| `XOSE` | Osaka Exchange | exchange | active | unconfirmed / — | Yes — JPX Group site |
+| `TOCOM` | Tokyo Commodity Exchange | exchange | active | unconfirmed / — | Yes — JPX Group site (listed as a distinct link on JPX's own homepage; whether its derivatives book has since been operationally folded into `XOSE` needs one more check before finalizing granularity) |
+| `JPNX` | Japannext PTS | pts | active | unconfirmed / — | Yes — Japannext's own site (X-Market/U-Market segments, Night Market session, published FIX/ITCH/OUCH specs) |
+| `ODX` | Osaka Digital Exchange | pts | active | unconfirmed / — | Yes — ODX's own site, self-described as "the third PTS in Japan" for equities |
+| `ODXST` | ODX START (security tokens) | pts | active | unconfirmed / — | Yes — same ODX source; a genuinely different instrument class (security tokens, not equities), kept as its own `VENUE_ID` rather than folded into `ODX` |
+| `CBOJ` | Cboe Japan proprietary trading system (formerly Chi-X Japan) | pts | **discontinued** | unconfirmed / **2025-08-29** | **Primary-source confirmed**, per Cboe Global Markets' own investor-relations press release, "Cboe Plans to Cease Japanese Equities Operations," July 23, 2025 (retrieved via Wayback Machine archive after the live IR page returned HTTP 403 to a direct fetch — archived copy is the actual source read, not the live URL). Announced wind-down of its Japanese equities business; operations expected to suspend **August 29, 2025**, subject to regulatory consultation for formal closure. Now the same confidence tier as the six directly-confirmed-active venues above, not merely corroborated. **Seed this row** — real historical trades predate the closure date and must remain representable; `DISCONTINUED_AT = '2025-08-29'` is what stops a generator/adaptor from producing new trades for it past that date, not the exclusion of the row itself. |
+| `CBOJBIDS` | Cboe BIDS Japan block trading platform | block_trading | **discontinued** | unconfirmed / **2025-08-29** | **Primary-source confirmed**, same press release — a second, distinct venue (block trading, not the continuous PTS order book) wound down in the same announcement. Not previously identified before this source was read; **seed this row too**, same `DISCONTINUED_AT` and same rationale as `CBOJ`. |
+
+`ACTIVE_FROM` is left `unconfirmed` for every row above, including the six active ones — a founding/listing date was not verified for any venue this session, and none should be guessed or defaulted. Populate before seeding, or leave `NULL` (per convention, do not guess a placeholder date) rather than treat "unconfirmed" as license to invent one.
 
 Regulator: `JURISDICTION_ID = 'JP'`, `REGULATOR_NAME = 'FSA/SESC'` (Financial Services Agency / Securities and Exchange Surveillance Commission — SESC referenced directly on JPX's own homepage as the destination for market-fairness complaints).
 
@@ -282,4 +289,5 @@ Re-confirmed live this session, not from memory: the CAT NMS Plan's own site (`c
 
 - v1 — initial contract, single `MARKET_ID` conflating regulator and venue.
 - v2 — split `MARKET_ID` into `JURISDICTION_ID` (regulator) and `VENUE_ID` (execution venue), after verifying Japan's real venue structure live.
-- v3 (this version) — nine fixes from a structural review: `DETECTOR_CALIBRATION.PARAMS` for pattern-match detectors, `WASH_DETECTION_COVERAGE` to surface (not hide) wash-trading blind spots, `POSITIONS` derivation fixed to `TRADES`-only with `LOADED_AT` restatement handling, `TRADE_REFERENCE_PRICES` + two correctly-timed slippage metrics for best execution, `APPROVED_OBLIGATIONS` view making the governance gate structural, new `MARKET_DATA_INGEST` role, new `BENEFICIAL_OWNERS` reference table, `OBLIGATION_RULE_CHUNKS` junction table replacing a single FK, and defined `MATCH_STATUS` semantics. `CBOJ` reclassified from "unverified" to "confirmed discontinued" per user input + independent corroboration.
+- v3 — nine fixes from a structural review: `DETECTOR_CALIBRATION.PARAMS` for pattern-match detectors, `WASH_DETECTION_COVERAGE` to surface (not hide) wash-trading blind spots, `POSITIONS` derivation fixed to `TRADES`-only with `LOADED_AT` restatement handling, `TRADE_REFERENCE_PRICES` + two correctly-timed slippage metrics for best execution, `APPROVED_OBLIGATIONS` view making the governance gate structural, new `MARKET_DATA_INGEST` role, new `BENEFICIAL_OWNERS` reference table, `OBLIGATION_RULE_CHUNKS` junction table replacing a single FK, and defined `MATCH_STATUS` semantics. `CBOJ` reclassified from "unverified" to "confirmed discontinued" per user input + independent corroboration.
+- v4 (this version) — `VENUES` gains `ACTIVE_FROM`/`DISCONTINUED_AT` date columns: a `STATUS` flag alone can't support historical trades from a now-closed venue, which real data requires (a discontinued venue still has real past trades to represent; a generator/adaptor must stop producing *new* trades for it at its actual closure date, not before, and not never). `CBOJ` upgraded from "corroborated" to **primary-source confirmed** — Cboe Global Markets' own July 23, 2025 press release ("Cboe Plans to Cease Japanese Equities Operations"), retrieved via Wayback Machine after the live IR page returned HTTP 403 — with an exact closure date (`DISCONTINUED_AT = '2025-08-29'`) and now seeded, not excluded. Same source surfaced a second, previously unidentified venue, `CBOJBIDS` (Cboe BIDS Japan block trading platform), wound down in the same announcement — added and seeded with the same date.
