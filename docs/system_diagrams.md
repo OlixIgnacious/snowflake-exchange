@@ -1,6 +1,6 @@
 # System &amp; flow diagrams
 
-Companion to `architecture.md` and `docs/canonical_schema_contract.md` (v5) — the mechanism behind the data model, the milestoning guarantee, and how each role moves through the system. Diagrams are Mermaid, rendered natively by GitHub/most Markdown viewers; column-level detail and the full FIX-by-FIX rationale live in the two docs above, not here.
+Companion to `architecture.md` and `docs/canonical_schema_contract.md` (v7) — the mechanism behind the data model, the milestoning guarantee, and how each role moves through the system. Diagrams are Mermaid, rendered natively by GitHub/most Markdown viewers; column-level detail and the full FIX-by-FIX rationale live in the two docs above, not here.
 
 ## 1. System architecture
 
@@ -40,7 +40,7 @@ flowchart TD
     MP --> ORD[ORDERS<br/>event-sourced, Fix #16<br/>PK: id, VENUE_ID, EVENT_TS]
     INS[INSTRUMENTS<br/>scoped by jurisdiction] -.->|scopes| ORD
     VEN -.->|scopes| ORD
-    ORD -.->|"ORDER_ID (nullable)"| TRD[TRADES<br/>immutable print<br/>sole source for POSITIONS]
+    ORD -.->|"ORDER_ID (nullable)"| TRD[TRADES<br/>immutable print<br/>sole source for POSITIONS<br/>MATCHING_MECHANISM, Fix #20]
     TRD --> POS[POSITIONS<br/>no VENUE_ID — cross-venue total<br/>accumulates, never ORDERS]
     TRD --> TXR[TRANSACTION_REPORTS<br/>milestoned, Fix #14<br/>MATCH_STATUS enum]
     TRD --> TRP[TRADE_REFERENCE_PRICES<br/>backfill = new LOADED_AT row]
@@ -49,7 +49,13 @@ flowchart TD
     RC[RULE_CORPUS<br/>amendment = new LOADED_AT row, Fix #17] --> ORC[OBLIGATION_RULE_CHUNKS<br/>0..N per obligation<br/>IS_ACTIVE tombstone, Fix #13]
     OM[OBLIGATION_MAP<br/>proposed → approved = new row, Fix #12] --> ORC
     OM --> AO[APPROVED_OBLIGATIONS<br/>view — latest row per key<br/>WHERE approved]
+
+    TXR --> RT["REPORT_TEMPLATES<br/>what the regulator requires, Fix #21<br/>STATUS: proposed/mapped/gap, Fix #27<br/>field-level, milestoned, citation-backed"]
+    RT --> RTC[REPORT_TEMPLATE_RULE_CHUNKS<br/>mirrors OBLIGATION_RULE_CHUNKS]
+    RC -.->|cites| RTC
 ```
+
+A required field with no current source is `STATUS = 'gap'` — a deliberate, non-blocking state (Fix #28), not an error or a silent omission. `REPORT_TEMPLATE_COVERAGE` surfaces which fields are `gap` per (`JURISDICTION_ID`, `REPORT_TYPE`), the same "surfaced, not hidden" role `WASH_DETECTION_COVERAGE` plays for wash trading.
 
 Every box above is milestoned identically (`CREATED_AT`/`CREATED_BY`/`LOADED_AT`/`LOADED_BY`, latest-row `_CURRENT` view) — that fact is stated once here rather than sixteen times; the labels called out per box are the ways each table's write pattern differs from the uniform rule.
 
@@ -171,12 +177,12 @@ flowchart LR
 
 Every non-empty cell below is `INSERT` or `SELECT`. There is no `UPDATE`/`DELETE` column because no role holds either, on anything, anywhere in `VIGIL.CORE`.
 
-| Role | Market-data tables (`JURISDICTIONS`…`TRANSACTION_REPORTS`) | `OBLIGATION_MAP` (base) | `APPROVED_OBLIGATIONS` (view) | `OBLIGATION_RULE_CHUNKS` | `RULE_CORPUS` | `AUDIT_LOG` | `VIGIL.EVAL` |
-|---|---|---|---|---|---|---|---|
-| `ANALYST_READ` | SELECT | — | SELECT | — | SELECT | — | — |
-| `GOVERNANCE_WRITE` | — | INSERT + SELECT | inherits, not granted directly | INSERT | INSERT | — | — |
-| `AUDIT_INSERT` | — | — | — | — | — | INSERT (no SELECT) | — |
-| `OFFICER_SIGNOFF` | `SP_RECORD_SIGNOFF` only — no direct table grants anywhere | | | | | | — |
-| `MARKET_DATA_INGEST` | INSERT (incl. `ORDERS`, `TRADES`, `TRADE_CORRECTIONS`) | — | — | — | — | — | — |
+| Role | Market-data tables (`JURISDICTIONS`…`TRANSACTION_REPORTS`) | `OBLIGATION_MAP` (base) | `APPROVED_OBLIGATIONS` (view) | `OBLIGATION_RULE_CHUNKS` | `RULE_CORPUS` | `REPORT_TEMPLATES` / `_RULE_CHUNKS` | `AUDIT_LOG` | `VIGIL.EVAL` |
+|---|---|---|---|---|---|---|---|---|
+| `ANALYST_READ` | SELECT | — | SELECT | — | SELECT | — | — | — |
+| `GOVERNANCE_WRITE` | — | INSERT + SELECT | inherits, not granted directly | INSERT | INSERT | INSERT | — | — |
+| `AUDIT_INSERT` | — | — | — | — | — | — | INSERT (no SELECT) | — |
+| `OFFICER_SIGNOFF` | `SP_RECORD_SIGNOFF` only — no direct table grants anywhere | | | | | | | — |
+| `MARKET_DATA_INGEST` | INSERT (incl. `ORDERS`, `TRADES`, `TRADE_CORRECTIONS`) | — | — | — | — | SELECT on `REPORT_TEMPLATES_CURRENT` only | — | — |
 
-**No role, anywhere, is ever granted `UPDATE` or `DELETE`** (Fix #18) — `OBLIGATION_MAP`'s grant above was the last one that did, closed in the same v5 pass that added milestoning everywhere else.
+**No role, anywhere, is ever granted `UPDATE` or `DELETE`** (Fix #18) — `OBLIGATION_MAP`'s grant above was the last one that did, closed in the same v5 pass that added milestoning everywhere else. `MARKET_DATA_INGEST`'s `SELECT` on `REPORT_TEMPLATES_CURRENT` (Fix #21, v6) is its only read grant anywhere — needed to know which fields a report requires before generating one, still no base-table read access. A `STATUS = 'gap'` transition (Fix #27, v7) is written by `GOVERNANCE_WRITE`'s existing `INSERT`-only grant — no new role or grant needed for a required field to be honestly marked unsourceable.
