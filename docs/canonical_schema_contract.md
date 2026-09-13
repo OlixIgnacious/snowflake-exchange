@@ -505,6 +505,7 @@ Append-only — a recalibration inserts a new row, never updates one. `DETECTOR_
 - **`GOVERNANCE_WRITE`** (Fix #12) — grant on `OBLIGATION_MAP` changes from `INSERT`/`UPDATE` to **`INSERT`-only**; `OBLIGATION_RULE_CHUNKS` and `RULE_CORPUS` were already `INSERT`-only and are unaffected. No functional role holds `UPDATE`/`DELETE` on any `VIGIL.CORE` table as of v5 (Fix #18) — this was the last one that did.
 - **`GOVERNANCE_WRITE`** (Fix #21, v6) — gains `INSERT`-only on `REPORT_TEMPLATES` and `REPORT_TEMPLATE_RULE_CHUNKS`. A report template is regulatory content (what a circular requires), the same category as `RULE_CORPUS`/`OBLIGATION_MAP`, not raw market data — it does not go through `MARKET_DATA_INGEST`.
 - **`MARKET_DATA_INGEST`** (Fix #21, v6) — gains `SELECT` on `REPORT_TEMPLATES_CURRENT`. This is the first `SELECT` grant this role has ever needed: generating a compliant `TRANSACTION_REPORTS` payload requires reading which fields are required before the row (with `REPORT_PAYLOAD_REF`, Fix #25) can be inserted — the role stays `INSERT`-only on every base table it writes, this is read-only access to a governance view, not a base-table grant.
+- **`ANALYST_READ`** (Fix #28, v7) — gains `SELECT` on `REPORT_TEMPLATE_COVERAGE`, the same grant category as `WASH_DETECTION_COVERAGE` (Fix #3). Without this, `rule-interpret`/`assure-report` have no role that can run the "surfaced, not hidden" query Fix #28 requires them to run alongside every completeness check.
 
 ## First jurisdiction: Japan (JP) — verified venue list to seed `VENUES`
 

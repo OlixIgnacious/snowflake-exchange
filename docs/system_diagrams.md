@@ -52,7 +52,7 @@ flowchart TD
 
     TXR --> RT["REPORT_TEMPLATES<br/>what the regulator requires, Fix #21<br/>STATUS: proposed/mapped/gap, Fix #27<br/>field-level, milestoned, citation-backed"]
     RT --> RTC[REPORT_TEMPLATE_RULE_CHUNKS<br/>mirrors OBLIGATION_RULE_CHUNKS]
-    RC -.->|cites| RTC
+    RC --> RTC
 ```
 
 A required field with no current source is `STATUS = 'gap'` — a deliberate, non-blocking state (Fix #28), not an error or a silent omission. `REPORT_TEMPLATE_COVERAGE` surfaces which fields are `gap` per (`JURISDICTION_ID`, `REPORT_TYPE`), the same "surfaced, not hidden" role `WASH_DETECTION_COVERAGE` plays for wash trading.
@@ -177,12 +177,12 @@ flowchart LR
 
 Every non-empty cell below is `INSERT` or `SELECT`. There is no `UPDATE`/`DELETE` column because no role holds either, on anything, anywhere in `VIGIL.CORE`.
 
-| Role | Market-data tables (`JURISDICTIONS`…`TRANSACTION_REPORTS`) | `OBLIGATION_MAP` (base) | `APPROVED_OBLIGATIONS` (view) | `OBLIGATION_RULE_CHUNKS` | `RULE_CORPUS` | `REPORT_TEMPLATES` / `_RULE_CHUNKS` | `AUDIT_LOG` | `VIGIL.EVAL` |
-|---|---|---|---|---|---|---|---|---|
-| `ANALYST_READ` | SELECT | — | SELECT | — | SELECT | — | — | — |
-| `GOVERNANCE_WRITE` | — | INSERT + SELECT | inherits, not granted directly | INSERT | INSERT | INSERT | — | — |
-| `AUDIT_INSERT` | — | — | — | — | — | — | INSERT (no SELECT) | — |
-| `OFFICER_SIGNOFF` | `SP_RECORD_SIGNOFF` only — no direct table grants anywhere | | | | | | | — |
-| `MARKET_DATA_INGEST` | INSERT (incl. `ORDERS`, `TRADES`, `TRADE_CORRECTIONS`) | — | — | — | — | SELECT on `REPORT_TEMPLATES_CURRENT` only | — | — |
+| Role | Market-data tables (`JURISDICTIONS`…`TRANSACTION_REPORTS`) | `OBLIGATION_MAP` (base) | `APPROVED_OBLIGATIONS` (view) | `OBLIGATION_RULE_CHUNKS` | `RULE_CORPUS` | `REPORT_TEMPLATES` / `_RULE_CHUNKS` | `REPORT_TEMPLATE_COVERAGE` (view) | `AUDIT_LOG` | `VIGIL.EVAL` |
+|---|---|---|---|---|---|---|---|---|---|
+| `ANALYST_READ` | SELECT | — | SELECT | — | SELECT | — | SELECT | — | — |
+| `GOVERNANCE_WRITE` | — | INSERT + SELECT | inherits, not granted directly | INSERT | INSERT | INSERT | — | — | — |
+| `AUDIT_INSERT` | — | — | — | — | — | — | — | INSERT (no SELECT) | — |
+| `OFFICER_SIGNOFF` | `SP_RECORD_SIGNOFF` only — no direct table grants anywhere | | | | | | | | — |
+| `MARKET_DATA_INGEST` | INSERT (incl. `ORDERS`, `TRADES`, `TRADE_CORRECTIONS`) | — | — | — | — | SELECT on `REPORT_TEMPLATES_CURRENT` only | — | — | — |
 
-**No role, anywhere, is ever granted `UPDATE` or `DELETE`** (Fix #18) — `OBLIGATION_MAP`'s grant above was the last one that did, closed in the same v5 pass that added milestoning everywhere else. `MARKET_DATA_INGEST`'s `SELECT` on `REPORT_TEMPLATES_CURRENT` (Fix #21, v6) is its only read grant anywhere — needed to know which fields a report requires before generating one, still no base-table read access. A `STATUS = 'gap'` transition (Fix #27, v7) is written by `GOVERNANCE_WRITE`'s existing `INSERT`-only grant — no new role or grant needed for a required field to be honestly marked unsourceable.
+**No role, anywhere, is ever granted `UPDATE` or `DELETE`** (Fix #18) — `OBLIGATION_MAP`'s grant above was the last one that did, closed in the same v5 pass that added milestoning everywhere else. `MARKET_DATA_INGEST`'s `SELECT` on `REPORT_TEMPLATES_CURRENT` (Fix #21, v6) is its only read grant anywhere — needed to know which fields a report requires before generating one, still no base-table read access. A `STATUS = 'gap'` transition (Fix #27, v7) is written by `GOVERNANCE_WRITE`'s existing `INSERT`-only grant — no new role or grant needed for a required field to be honestly marked unsourceable. `ANALYST_READ`'s `SELECT` on `REPORT_TEMPLATE_COVERAGE` (Fix #28, v7) is the same grant category as its existing `WASH_DETECTION_COVERAGE` access — without it, `rule-interpret`/`assure-report` would have no role able to run the completeness-companion query.
