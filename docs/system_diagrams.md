@@ -186,3 +186,101 @@ Every non-empty cell below is `INSERT` or `SELECT`. There is no `UPDATE`/`DELETE
 | `MARKET_DATA_INGEST` | INSERT (incl. `ORDERS`, `TRADES`, `TRADE_CORRECTIONS`) | — | — | — | — | SELECT on `REPORT_TEMPLATES_CURRENT` only | — | — | — |
 
 **No role, anywhere, is ever granted `UPDATE` or `DELETE`** (Fix #18) — `OBLIGATION_MAP`'s grant above was the last one that did, closed in the same v5 pass that added milestoning everywhere else. `MARKET_DATA_INGEST`'s `SELECT` on `REPORT_TEMPLATES_CURRENT` (Fix #21, v6) is its only read grant anywhere — needed to know which fields a report requires before generating one, still no base-table read access. A `STATUS = 'gap'` transition (Fix #27, v7) is written by `GOVERNANCE_WRITE`'s existing `INSERT`-only grant — no new role or grant needed for a required field to be honestly marked unsourceable. `ANALYST_READ`'s `SELECT` on `REPORT_TEMPLATE_COVERAGE` (Fix #28, v7) is the same grant category as its existing `WASH_DETECTION_COVERAGE` access — without it, `rule-interpret`/`assure-report` would have no role able to run the completeness-companion query.
+
+## 8. Surveillance audit trail (built via Snowflake CoCo CLI, 2026-09-14)
+
+Added after the diagrams above, as a demo-layer pipeline turning a detector view's live result into a persisted, queryable audit row — closing a gap that existed since Phase 2/6 (`AUDIT_LOG` was RBAC-governed and read by `narrative-draft`, but nothing had ever written a real row to it). Full build/review log in `TRACKER.md`/`NOTES.md`.
+
+### 8.1 Current architecture
+
+```mermaid
+flowchart TD
+    GEN["generator/generate.py<br/>synthetic Japan dataset"] -->|"MARKET_DATA_INGEST"| CORE[("VIGIL.CORE<br/>18 tables, milestoned, append-only")]
+
+    CAL[("DETECTOR_CALIBRATION<br/>thresholds, never hardcoded")]
+
+    subgraph DETECTORS["Detectors (Phase 3)"]
+        WT["WASH_TRADING_CANDIDATES<br/>+ WASH_DETECTION_COVERAGE"]
+        SP["SPOOFING_LAYERING_SIGNALS"]
+        PL["POSITION_LIMIT_BREACHES"]
+        RT["REPORTING_TIMELINESS_SIGNALS<br/>+ REPORT_TEMPLATE_COVERAGE"]
+        BE["EXECUTION_SLIPPAGE / ARRIVAL_SLIPPAGE<br/>(0 rows -- no reference price data yet)"]
+    end
+
+    CORE --> WT & SP & PL & RT & BE
+    CAL -.-> WT & SP & PL & RT
+
+    subgraph AUDIT["Evidence trail -- built via CoCo CLI"]
+        TASK["TASK_SURVEILLANCE_RUN_JP<br/>every 10 min"] -->|CALL| SPROC["SP_LOG_SURVEILLANCE_RUN<br/>EXECUTE AS OWNER"]
+        SPROC -->|"INSERT, 1 row/detector"| ALOG[("AUDIT_LOG<br/>append-only")]
+        ALOG --> SRL["SURVEILLANCE_RUN_LOG<br/>normalized FLAGGED_COUNT"]
+    end
+
+    WT & SP & PL & RT --> SPROC
+
+    subgraph ASK["Ask in natural language"]
+        SV1["SV_TRADE_SURVEILLANCE"]
+        SV2["SV_OBLIGATIONS_REPORTING"]
+        SV3["SV_SURVEILLANCE_AUDIT"]
+        AGENT{{"VIGIL_SURVEILLANCE_AGENT<br/>claude-haiku-4-5, 3 tools"}}
+        SV1 & SV2 & SV3 --> AGENT
+    end
+
+    CORE --> SV1 & SV2
+    SRL --> SV3
+    AGENT --> ANALYST(["Analyst / compliance user"])
+
+    subgraph PRESENT["Presentation"]
+        DASH["Streamlit -- VIGIL_DASHBOARD"]
+        NB["Jupyter -- vigil_demo.ipynb"]
+    end
+
+    WT & SP & PL & RT & BE --> DASH & NB
+```
+
+### 8.2 Signal → evidence → documented finding: coverage vs. the gap
+
+`SP_LOG_SURVEILLANCE_RUN` covers 3 of Vigil's 4 obligation types (trade surveillance, position limits, post-trade reporting timeliness) end to end. Best execution was never wired in, and even where the pipeline is complete, it stops at a queryable count -- it does not yet produce an actual filed report or assurance verdict as the "documented finding."
+
+```mermaid
+flowchart LR
+    subgraph COVERED["Covered today"]
+        direction TB
+        S1["Signal:<br/>wash trading / spoofing /<br/>position limit / reporting"] --> E1["Evidence:<br/>AUDIT_LOG row via<br/>SP_LOG_SURVEILLANCE_RUN"]
+        E1 --> Q1["Queryable:<br/>SURVEILLANCE_RUN_LOG<br/>SV_SURVEILLANCE_AUDIT -- agent"]
+    end
+
+    subgraph GAP["Not covered yet"]
+        direction TB
+        S2["Signal:<br/>best execution slippage"] -.->|"never logged to AUDIT_LOG"| E2["Evidence:<br/>none"]
+        Q1 -.->|"answer is a number,<br/>not a filed document"| F["Documented finding:<br/>a real report/assurance artifact"]
+    end
+
+    style GAP stroke-dasharray: 5 5
+```
+
+### 8.3 Scheduled run -- exact call sequence
+
+```mermaid
+sequenceDiagram
+    participant T as Snowflake Task<br/>(10 min cron)
+    participant P as SP_LOG_SURVEILLANCE_RUN
+    participant D as Detector views (x4)
+    participant A as AUDIT_LOG
+    participant S as SURVEILLANCE_RUN_LOG /<br/>SV_SURVEILLANCE_AUDIT
+    participant AG as VIGIL_SURVEILLANCE_AGENT
+    participant U as Analyst
+
+    T->>P: CALL SP_LOG_SURVEILLANCE_RUN('JP')
+    loop for each of 4 detectors
+        P->>D: SELECT flagged rows WHERE JURISDICTION_ID='JP'
+        D-->>P: counts (e.g. 28 non-exempt, 1 breach)
+        P->>A: INSERT AUDIT_LOG row (JSON OUTPUT, shared snapshot_id)
+    end
+    Note over A: 4 new rows, append-only,<br/>never mutated
+
+    U->>AG: "How many wash-trading findings today?"
+    AG->>S: generated SQL (self-corrected once, live)
+    S-->>AG: SUM(flagged_count) = 56
+    AG-->>U: "56 wash-trading findings logged today"
+```
