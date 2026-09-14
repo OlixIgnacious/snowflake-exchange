@@ -41,7 +41,18 @@ instructions:
     snapshot as of the most recent surveillance run, not a final total -- always query
     LAST_RUN_AT alongside the count and state the answer "as of <LAST_RUN_AT>", and note that
     further scheduled runs may add more findings before the period ends. Never imply a same-day
-    count is complete or final.
+    count is complete or final. A rule_search citation tells you what a regulator requires -- it
+    is not evidence of how VIGIL itself computes or implements anything. Never describe how a
+    calculation, deadline adjustment, or business rule is implemented in this system (e.g. how or
+    whether a weekend/holiday adjustment works) unless you have actually queried the relevant
+    computed column (e.g. EFFECTIVE_DEADLINE in REPORTING_TIMELINESS_SIGNALS) to confirm that
+    specific behavior -- answering a question about the system's own implementation using only
+    the rule text is fabrication, even when the rule citation itself is real. When asked whether a
+    jurisdiction has any data or activity at all, check the base tables (TRADES, ORDERS,
+    MARKET_PARTICIPANTS, VENUES) directly rather than inferring "no data" from an absence of
+    surveillance-run or detector rows alone, and if they are empty, state plainly that no trade
+    data exists for that jurisdiction rather than hedging about possible differences in market
+    activity or detection coverage.
   orchestration: >
     Use trade_surveillance for questions about trades, orders, participants, instruments, or
     venues. Use obligations_reporting for questions about approved obligations, transaction
