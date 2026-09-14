@@ -284,3 +284,115 @@ sequenceDiagram
     S-->>AG: SUM(flagged_count) = 56
     AG-->>U: "56 wash-trading findings logged today"
 ```
+
+## 9. The other three product skills
+
+Section 8 only diagrams `surveillance-query`'s path (the one skill that fits the chat-agent tool-call model). The other three are directly-callable Python/CLI skills doing bespoke multi-step orchestration, per architecture.md's own decision rule -- none of them have ever been diagrammed until now.
+
+### 9.1 `rule-interpret` — gap analysis
+
+`find_gaps()` is the mechanism only -- `required_concepts` is caller-supplied (an analyst's or a future NLP step's reading of a rule chunk), not derived from real FSA/SESC text yet (architecture.md's "What's explicitly deferred").
+
+```mermaid
+flowchart TD
+    RULE["New rule/circular text<br/>chunked into RULE_CORPUS"] --> EXTRACT["Analyst reads a rule chunk:<br/>which detector-backed concepts<br/>does it require? (required_concepts)"]
+    APPROVED[("APPROVED_OBLIGATIONS<br/>view, never base OBLIGATION_MAP")] --> DIFF
+    EXTRACT --> DIFF["find_gaps()<br/>required_concepts minus approved_detector_names"]
+    DIFF --> GAPS{"Any gaps?"}
+    GAPS -->|"yes, per gap"| PROPOSE["New 'proposed' OBLIGATION_MAP row<br/>citing this RULE_CHUNK_ID<br/>GOVERNANCE_WRITE, INSERT-only"]
+    GAPS -->|"no"| DONE["Already covered -- no action"]
+    PROPOSE --> REVIEW["Governance officer reviews"]
+    REVIEW -->|"approved"| APPROVED2["New 'approved' row<br/>new INSERT, never UPDATE, Fix #12"]
+    APPROVED2 -.-> APPROVED
+```
+
+### 9.2 `assure-report` — pre-submission assurance verdict
+
+Wraps `ingest/report_adaptor.py` (section 10 below) rather than reimplementing it -- this skill's job is turning a `MappingResult` into a verdict an analyst can act on.
+
+```mermaid
+flowchart TD
+    TR["TRANSACTION_REPORTS_CURRENT row<br/>a draft/pending report"] --> CANON["Canonical source row<br/>e.g. TRADES.PRICE, .VOLUME"]
+    TPL["REPORT_TEMPLATES_CURRENT<br/>WHERE JURISDICTION_ID, REPORT_TYPE"] --> MAP
+    CANON --> MAP["map_report()<br/>ingest/report_adaptor.py"]
+    MAP --> RESULT["MappingResult:<br/>payload, fields_complete,<br/>gap_fields, unresolved_required_fields"]
+    COV[("REPORT_TEMPLATE_COVERAGE<br/>PCT_REQUIRED_FIELDS_MAPPED")] --> VERDICT
+    RESULT --> VERDICT["assure()<br/>skills/assure_report.py"]
+    VERDICT --> OUT{"AssuranceVerdict"}
+    OUT -->|"ready_to_submit = TRUE"| SUBMIT["render_payload() --<br/>REPORT_PAYLOAD_REF"]
+    OUT -->|"gap / unresolved fields"| ANALYST2["Surfaced with exact reasons,<br/>never fabricated or hidden -- Fix #28/#29"]
+```
+
+### 9.3 `narrative-draft` — lineage & remediation narrative
+
+A pure graph walk over caller-supplied `AUDIT_LOG` rows -- no query logic, no LLM fabrication. Every fact in the output traces to a row in the chain.
+
+```mermaid
+flowchart TD
+    FINDING["AUDIT_LOG row --<br/>a detector finding / surveillance run"] --> WALK["build_lineage_chain()<br/>walks SIGNOFF_FOR_RUN_ID"]
+    SIGNOFF["Later AUDIT_LOG row --<br/>a sign-off, SP_RECORD_SIGNOFF"] --> WALK
+    WALK --> CHAIN["Chronological chain:<br/>finding -- cited rule chunks -- sign-off decisions"]
+    CHAIN --> DRAFT["draft_narrative()<br/>plain-language render"]
+    DRAFT --> OUT2["Every fact traceable to the chain --<br/>nothing invented"]
+```
+
+## 10. Report generation / adaptor (`ingest/report_adaptor.py`)
+
+Python, not SQL -- architecture.md's build order explicitly separates this from the Semantic Views. `STATUS` on each `REPORT_TEMPLATES_CURRENT` field drives three different outcomes per field, not one blanket rule.
+
+```mermaid
+flowchart TD
+    START["For each TemplateField in<br/>REPORT_TEMPLATES_CURRENT"] --> STATUS{"STATUS?"}
+    STATUS -->|"gap"| GAPLIST["Add to gap_fields --<br/>surfaced, Fix #28, never fabricated<br/>or silently dropped"]
+    STATUS -->|"proposed"| SKIP["Skip -- not ready to drive<br/>report generation yet"]
+    STATUS -->|"mapped"| LOOKUP["raw_value = canonical_row[SOURCE_MAPPING]"]
+    LOOKUP --> FORMAT["format_value() --<br/>ISO8601 / decimal(p) / passthrough"]
+    FORMAT --> PAYLOAD["Add FIELD_NAME: formatted_value<br/>to payload"]
+    PAYLOAD --> REQCHECK{"IS_REQUIRED and<br/>formatted is NULL?"}
+    REQCHECK -->|"yes"| UNRESOLVED["Add to unresolved_required_fields"]
+    REQCHECK -->|"no"| CONTINUE["Next field"]
+    GAPLIST & SKIP & UNRESOLVED & CONTINUE --> COMPLETE["All fields processed"]
+    COMPLETE --> FC["fields_complete =<br/>len(unresolved_required_fields) == 0<br/>gap fields never block this -- Fix #29"]
+    FC --> RENDER["render_payload() --<br/>JSON placeholder format,<br/>real regulator format deferred"]
+    RENDER --> STORE["Stored as<br/>TRANSACTION_REPORTS.REPORT_PAYLOAD_REF -- Fix #25"]
+```
+
+## 11. CoCo demo-video phase map
+
+Maps the hackathon's four required phases onto what actually happened and which tool did it -- for structuring the recording, not a system diagram. Full detail in `TRACKER.md`/`NOTES.md`.
+
+```mermaid
+flowchart TD
+    subgraph PLAN["1. Planning -- CoCo CLI, 2026-09-12"]
+        direction TB
+        P1["Reviewed Praman's plug_and_play_architecture.md,<br/>found faults, via CoCo"]
+        P2["Pivoted: 'exchange regulatory reporting,<br/>not banking' -- Vigil's origin"]
+        P3["Selected JPX/SEC, checked for<br/>multiple venues per region TSE/ODX/JPNX"]
+        P1 --> P2 --> P3
+    end
+
+    subgraph DEV["2. Development"]
+        direction TB
+        D1["Claude Code: DDL, RBAC, detectors,<br/>generator, skills, Cortex Agent -- Phases 1-6"]
+        D2["CoCo CLI: SP_LOG_SURVEILLANCE_RUN --<br/>RBAC violation caught and self-corrected"]
+        D1 --> D2
+    end
+
+    subgraph EXEC["3. Execution"]
+        direction TB
+        E1["Claude Code: scripts/run_sql.py,<br/>synthetic data load, 3600+ orders"]
+        E2["CoCo CLI: TASK_SURVEILLANCE_RUN_JP --<br/>created, resumed, EXECUTE TASK triggered live"]
+        E1 --> E2
+    end
+
+    subgraph TEST["4. Testing & validation"]
+        direction TB
+        T1["Claude Code: pytest 29 tests,<br/>verify_rbac.py 27 checks,<br/>notebook executed against live data"]
+        T2["CoCo CLI: RUN_ID uniqueness check,<br/>AUDIT_INSERT negative-SELECT proof,<br/>live NL question -- agent self-corrected SQL"]
+        T1 --> T2
+    end
+
+    PLAN --> DEV --> EXEC --> TEST
+```
+
+Where to find the Planning-phase evidence for the recording: `~/.snowflake/cortex/history`, timestamped `2026-09-12`, in the sibling `Praman` repo directory (not this one) -- it predates this project's own git history entirely.
