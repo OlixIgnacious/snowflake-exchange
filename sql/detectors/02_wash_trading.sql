@@ -80,9 +80,19 @@ MATCHED_PAIR AS (
 SELECT
     s.*,
     COALESCE(ec.PARAMS, mc.PARAMS) AS CALIBRATION_PARAMS,
-    ARRAY_CONTAINS(
-        TO_VARIANT(s.MATCHING_MECHANISM),
-        COALESCE(ec.PARAMS:exempt_matching_mechanisms, mc.PARAMS:exempt_matching_mechanisms)
+    -- COALESCE(..., FALSE): a venue with no wash_trading calibration seeded yet must never be
+    -- silently treated as exempt. Without this, ARRAY_CONTAINS against a NULL array (no
+    -- calibration found) returns NULL, not FALSE -- and a consumer filtering
+    -- "WHERE NOT IS_TRIGGER_EXEMPT" would silently drop those NULL rows via SQL three-valued
+    -- logic, the exact "silently blind" failure WASH_DETECTION_COVERAGE (Fix #3) exists to
+    -- prevent elsewhere in this same detector. Missing calibration must mean "flag for review",
+    -- never "hide from review."
+    COALESCE(
+        ARRAY_CONTAINS(
+            TO_VARIANT(s.MATCHING_MECHANISM),
+            COALESCE(ec.PARAMS:exempt_matching_mechanisms, mc.PARAMS:exempt_matching_mechanisms)
+        ),
+        FALSE
     ) AS IS_TRIGGER_EXEMPT
 FROM (
     SELECT * FROM SELF_TRADE

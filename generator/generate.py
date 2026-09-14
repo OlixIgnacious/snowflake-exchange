@@ -216,14 +216,20 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
         "REGULATORY_ATTRIBUTES": None, **audit_cols(wt_ts, "generator"),
     })
 
-    # --- Injected spoofing/layering case: one participant, high cancel-unfilled ratio across many days ---
+    # --- Injected spoofing/layering case: a participant with NORMAL cancel activity for a
+    # baseline period, then a SPIKE -- the detector z-scores TODAY against the participant's own
+    # trailing baseline (architecture.md), so a uniformly-bad actor from day one never deviates
+    # from themselves and would never be flagged; the test case has to include a genuine change
+    # in behavior to be a meaningful positive case for this specific detection method.
     spoof_start, spoof_end = _venue_window(next(v for v in cfg.venues if v.venue_id == spoof_venue), cfg)
-    for day_offset in range(20):
+    n_baseline_days, n_spike_days = 10, 5
+    for day_offset in range(n_baseline_days + n_spike_days):
         day = spoof_start + timedelta(days=day_offset * 3)
         if day > spoof_end:
             break
-        # heavy cancel activity for the spoofing participant
-        for _ in range(15):
+        is_spike_day = day_offset >= n_baseline_days
+        n_cancel_orders = 15 if is_spike_day else 2  # normal days: mostly filled, low cancel ratio
+        for _ in range(n_cancel_orders):
             oid = new_order_id()
             ts = datetime(day.year, day.month, day.day, rng.randint(9, 15), rng.randint(0, 59))
             qty = rng.randint(1000, 5000)
@@ -241,16 +247,18 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
                 "CURRENCY": cfg.currency, "QUANTITY": qty, "FILLED_QUANTITY": 0, "REGULATORY_ATTRIBUTES": None,
                 **audit_cols(ts, "generator", loaded_at=ts + timedelta(seconds=5)),
             })
-        # one small submitted-and-filled order to keep SUBMITTED_VOLUME nonzero and ratio meaningful
-        oid2 = new_order_id()
-        ts2 = datetime(day.year, day.month, day.day, 16, 0)
-        tables["ORDERS"].append({
-            "ORDER_ID": oid2, "JURISDICTION_ID": cfg.jurisdiction_id, "VENUE_ID": spoof_venue,
-            "INSTRUMENT_ID": spoof_instrument, "PARTICIPANT_ID": spoof_participant, "SIDE": "sell",
-            "ORDER_TYPE": "limit", "EVENT_TYPE": "new", "EVENT_TS": ts2, "PRICE": 300.0,
-            "CURRENCY": cfg.currency, "QUANTITY": 100, "FILLED_QUANTITY": 0, "REGULATORY_ATTRIBUTES": None,
-            **audit_cols(ts2, "generator"),
-        })
+        # steady submitted-and-filled volume every day, so SUBMITTED_VOLUME is always nonzero
+        # and the ratio is meaningful on both normal and spike days.
+        for _ in range(8):
+            oid2 = new_order_id()
+            ts2 = datetime(day.year, day.month, day.day, rng.randint(15, 16), rng.randint(0, 59))
+            tables["ORDERS"].append({
+                "ORDER_ID": oid2, "JURISDICTION_ID": cfg.jurisdiction_id, "VENUE_ID": spoof_venue,
+                "INSTRUMENT_ID": spoof_instrument, "PARTICIPANT_ID": spoof_participant, "SIDE": "sell",
+                "ORDER_TYPE": "limit", "EVENT_TYPE": "new", "EVENT_TS": ts2, "PRICE": 300.0,
+                "CURRENCY": cfg.currency, "QUANTITY": 500, "FILLED_QUANTITY": 0, "REGULATORY_ATTRIBUTES": None,
+                **audit_cols(ts2, "generator"),
+            })
 
     # --- POSITIONS: accumulate NET_QUANTITY from TRADES only (Fix #4) ---
     running: dict[tuple, float] = {}
@@ -282,7 +290,11 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
         })
 
     # --- DETECTOR_CALIBRATION seeds ---
-    for v in active_venues:
+    # All venues, including discontinued ones -- a closed venue's real historical trades still
+    # need to be surveillable (architecture.md's whole rationale for date-bounding rather than
+    # excluding a discontinued venue). Calibration scope is "can this venue's trades be
+    # analyzed," not "is this venue still open."
+    for v in cfg.venues:
         tables["DETECTOR_CALIBRATION"].append({
             "JURISDICTION_ID": cfg.jurisdiction_id, "VENUE_ID": v.venue_id, "DETECTOR_NAME": "wash_trading",
             "DIMENSION_KEY": None, "Z_THRESHOLD": None, "MIN_BASELINE_PERIODS": None,
