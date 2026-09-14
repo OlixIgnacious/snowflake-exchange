@@ -60,6 +60,9 @@ CREATE OR REPLACE SEMANTIC VIEW SV_DETECTOR_FINDINGS
         RPTSIG.IS_OVERDUE_UNSUBMITTED AS RPTSIG.IS_OVERDUE_UNSUBMITTED WITH SYNONYMS ('overdue'),
         RPTSIG.IS_INCOMPLETE AS RPTSIG.IS_INCOMPLETE,
         RPTSIG.IS_MISMATCHED AS RPTSIG.IS_MISMATCHED,
+        RPTSIG.SUBMITTED_AT AS RPTSIG.SUBMITTED_AT,
+        RPTSIG.DEADLINE AS RPTSIG.DEADLINE WITH SYNONYMS ('raw deadline') COMMENT = 'The unadjusted deadline, before the business-day correction below.',
+        RPTSIG.EFFECTIVE_DEADLINE AS RPTSIG.EFFECTIVE_DEADLINE WITH SYNONYMS ('effective deadline', 'business-day-adjusted deadline') COMMENT = 'The real deadline IS_LATE_SUBMISSION is actually computed against -- DEADLINE moved to the next business day when it falls on a weekend. Query this directly to confirm weekend-handling behavior; do not infer it from RULE_CORPUS text (added 2026-09-15 specifically so this is queryable, not just re-derivable).',
 
         EXECSLIP.TRADE_ID AS EXECSLIP.TRADE_ID,
         EXECSLIP.INSTRUMENT_ID AS EXECSLIP.INSTRUMENT_ID,

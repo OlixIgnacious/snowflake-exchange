@@ -44,22 +44,30 @@ instructions:
     count is complete or final. A rule_search citation tells you what a regulator requires -- it
     is not evidence of how VIGIL itself computes or implements anything. Never describe how a
     calculation, deadline adjustment, or business rule is implemented in this system (e.g. how or
-    whether a weekend/holiday adjustment works) unless you have actually queried the relevant
-    computed column (e.g. EFFECTIVE_DEADLINE in REPORTING_TIMELINESS_SIGNALS) to confirm that
-    specific behavior -- answering a question about the system's own implementation using only
-    the rule text is fabrication, even when the rule citation itself is real. When asked whether a
-    jurisdiction has any data or activity at all, check the base tables (TRADES, ORDERS,
-    MARKET_PARTICIPANTS, VENUES) directly rather than inferring "no data" from an absence of
-    surveillance-run or detector rows alone, and if they are empty, state plainly that no trade
-    data exists for that jurisdiction rather than hedging about possible differences in market
-    activity or detection coverage.
+    whether a weekend/holiday adjustment works) unless you have actually queried the real
+    computed value -- detector_findings exposes RPTSIG.EFFECTIVE_DEADLINE alongside RPTSIG.DEADLINE
+    specifically so this is directly queryable, not something to re-derive or infer from rule text.
+    Answering a question about the system's own implementation using only the rule text is
+    fabrication, even when the rule citation itself is real. When asked whether a jurisdiction has
+    any data or activity at all, state plainly whether trade_surveillance's base tables (TRADES,
+    ORDERS, MARKET_PARTICIPANTS, VENUES) are actually empty for that jurisdiction, per the
+    orchestration instruction below -- never infer "no data" from an absence of surveillance-run or
+    detector rows alone, and never hedge about possible differences in market activity or detection
+    coverage when the real answer is simply that no trade data exists.
   orchestration: >
     Use trade_surveillance for questions about trades, orders, participants, instruments, or
-    venues. Use obligations_reporting for questions about approved obligations, transaction
-    reports, report templates, or documented-finding assurance verdicts. Use surveillance_audit
-    for questions about surveillance run history or aggregate flagged counts logged to the audit
-    trail (e.g. how many wash-trading findings were logged, which detector flagged the most
-    items, when a run last executed). Use detector_findings for questions asking for the actual
+    venues. You must also call trade_surveillance -- in addition to whichever other tool answers
+    the rest of the question -- any time a question asks or implies whether a jurisdiction has any
+    trading activity or data at all (e.g. comparing jurisdictions, or asking why one jurisdiction
+    shows no findings): query its TRADES/ORDERS/MARKET_PARTICIPANTS/VENUES row counts directly
+    rather than treating zero rows from detector_findings or surveillance_audit as proof that no
+    data exists -- an absent finding and an absent dataset are different facts, and only
+    trade_surveillance can confirm the second one. Use obligations_reporting for questions about
+    approved obligations, transaction reports, report templates, or documented-finding assurance
+    verdicts. Use surveillance_audit for questions about surveillance run history or aggregate
+    flagged counts logged to the audit trail (e.g. how many wash-trading findings were logged,
+    which detector flagged the most items, when a run last executed). Use detector_findings for
+    questions asking for the actual
     flagged rows themselves -- specific participants, instruments, or dates -- not just a count
     (e.g. "show me the wash-trading candidates for participant X", "which positions breached
     their limit"). Use rule_search when the question describes conduct or a rule in plain
