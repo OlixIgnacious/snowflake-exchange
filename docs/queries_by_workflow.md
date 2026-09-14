@@ -161,6 +161,137 @@ claimed): all three jurisdictions currently show `missing_detectors: []` (full 5
 sites for new or amended source documents (that needs External Access Integration, not enabled in
 this pass -- see the "Known gaps" section above).
 
+## 4d. Complex / cross-cutting queries (added 2026-09-15)
+
+None of these are reachable through the agent's three tools -- each spans multiple detector views,
+jurisdictions, or Cortex Search, which is exactly why they belong here rather than in section 4's
+single-view examples. Every result below is real, run against live data on 2026-09-15.
+
+**Cross-detector risk correlation** -- a participant flagged for spoofing/layering who also
+appears in a non-exempt wash-trading pair (a genuine "repeat offender" signal no single detector
+view can answer):
+```sql
+SELECT DISTINCT s.PARTICIPANT_ID, s.JURISDICTION_ID
+FROM SPOOFING_LAYERING_SIGNALS s
+JOIN WASH_TRADING_CANDIDATES w
+    ON w.JURISDICTION_ID = s.JURISDICTION_ID
+   AND (w.PARTICIPANT_ID_1 = s.PARTICIPANT_ID OR w.PARTICIPANT_ID_2 = s.PARTICIPANT_ID)
+WHERE s.IS_FLAGGED AND NOT w.IS_TRIGGER_EXEMPT;
+```
+Confirmed real result: **0 rows.** P999 (the only flagged spoofing participant) never appears in a
+wash-trading pair, and P011 (the only position-limit breach) doesn't either -- the synthetic
+dataset has no built-in multi-detector repeat-offender scenario. Honest, not a bug; the query is
+real and would fire the moment such a participant exists.
+
+**Escalating-behavior trend** -- participants whose cancel-ratio z-score rose for two consecutive
+periods and ended flagged (a window-function pattern no detector view computes on its own):
+```sql
+WITH trend AS (
+    SELECT PARTICIPANT_ID, INSTRUMENT_ID, VENUE_ID, EVENT_DATE, CANCEL_RATIO_ZSCORE, IS_FLAGGED,
+           LAG(CANCEL_RATIO_ZSCORE, 1) OVER (PARTITION BY PARTICIPANT_ID, INSTRUMENT_ID, VENUE_ID ORDER BY EVENT_DATE) AS Z1,
+           LAG(CANCEL_RATIO_ZSCORE, 2) OVER (PARTITION BY PARTICIPANT_ID, INSTRUMENT_ID, VENUE_ID ORDER BY EVENT_DATE) AS Z2
+    FROM SPOOFING_LAYERING_SIGNALS
+)
+SELECT PARTICIPANT_ID, INSTRUMENT_ID, EVENT_DATE, Z2, Z1, CANCEL_RATIO_ZSCORE
+FROM trend WHERE CANCEL_RATIO_ZSCORE > Z1 AND Z1 > Z2 AND IS_FLAGGED;
+```
+Confirmed real result: **0 rows** -- P999's flagged day is a single-day spike test case (Fix
+P999/patch_spoofing_and_calibration.py), not a multi-day escalation, so there's nothing for this
+pattern to catch yet. Same honesty note as above.
+
+**Compound reporting risk** -- report types with both a nonzero late-submission count *and* an
+unmapped required field (two independently-tracked risk signals that only matter together):
+```sql
+SELECT sig.JURISDICTION_ID, sig.REPORT_TYPE, COUNT_IF(sig.IS_LATE_SUBMISSION) AS LATE_COUNT,
+       cov.PCT_REQUIRED_FIELDS_MAPPED, cov.GAP_FIELD_NAMES
+FROM REPORTING_TIMELINESS_SIGNALS sig
+JOIN REPORT_TEMPLATE_COVERAGE cov
+    ON cov.REPORT_TYPE = sig.REPORT_TYPE AND cov.JURISDICTION_ID = sig.JURISDICTION_ID
+GROUP BY sig.JURISDICTION_ID, sig.REPORT_TYPE, cov.PCT_REQUIRED_FIELDS_MAPPED, cov.GAP_FIELD_NAMES
+HAVING LATE_COUNT > 0;
+```
+Confirmed real result: `JP, transaction_report, LATE_COUNT=59, PCT_REQUIRED_FIELDS_MAPPED=0.75,
+GAP_FIELD_NAMES=["Trading_Capacity"]` -- the same 59 late reports from section 1, now shown
+alongside the fact that 25% of the template's required fields (just `Trading_Capacity`) have no
+data source, in one query.
+
+**Cross-jurisdiction obligation-citation pivot** -- every detector family's real citation, JP vs.
+US vs. EU, side by side:
+```sql
+SELECT d.DETECTOR_NAME,
+    MAX(CASE WHEN o.JURISDICTION_ID='JP' THEN r.SECTION_REF END) AS JP_CITATION,
+    MAX(CASE WHEN o.JURISDICTION_ID='US' THEN r.SECTION_REF END) AS US_CITATION,
+    MAX(CASE WHEN o.JURISDICTION_ID='EU' THEN r.SECTION_REF END) AS EU_CITATION
+FROM (SELECT column1 AS DETECTOR_NAME FROM VALUES
+        ('wash_trading'),('spoofing_layering'),('position_limit'),('reporting_timeliness'),('best_execution')) d
+LEFT JOIN APPROVED_OBLIGATIONS o ON o.DETECTOR_NAME = d.DETECTOR_NAME
+LEFT JOIN OBLIGATION_RULE_CHUNKS_CURRENT c ON c.OBLIGATION_ID = o.OBLIGATION_ID AND c.JURISDICTION_ID = o.JURISDICTION_ID
+LEFT JOIN RULE_CORPUS_CURRENT r ON r.CHUNK_ID = c.RULE_CHUNK_ID
+GROUP BY d.DETECTOR_NAME ORDER BY d.DETECTOR_NAME;
+```
+Confirmed real, all 15 cells populated (no NULLs) -- e.g. `wash_trading`: JP=`Article 159,
+Paragraph 1, Item (i)`, US=`Section 9(a)(1) [15 U.S.C. Sec 78i(a)(1)]`, EU=`Article 12(1)(a) and
+Annex I, Section A(c)`.
+
+**Full cross-detector risk profile for one participant** -- every finding across every detector,
+for a single `PARTICIPANT_ID`, one query (`UNION ALL`, not achievable via any single view):
+```sql
+SELECT 'spoofing_layering' AS DETECTOR, EVENT_DATE::VARCHAR AS EVENT_DATE, CANCEL_RATIO_ZSCORE::VARCHAR AS DETAIL
+FROM SPOOFING_LAYERING_SIGNALS WHERE PARTICIPANT_ID = 'P999' AND IS_FLAGGED
+UNION ALL
+SELECT 'wash_trading', EXECUTION_TIMESTAMP_1::VARCHAR, CANDIDATE_TYPE
+FROM WASH_TRADING_CANDIDATES WHERE (PARTICIPANT_ID_1 = 'P999' OR PARTICIPANT_ID_2 = 'P999') AND NOT IS_TRIGGER_EXEMPT
+UNION ALL
+SELECT 'position_limit', AS_OF_DATE::VARCHAR, PCT_OF_LIMIT::VARCHAR
+FROM POSITION_LIMIT_BREACHES WHERE PARTICIPANT_ID = 'P999' AND IS_BREACH;
+```
+Confirmed real: exactly one row, `('spoofing_layering', '2025-07-04', '3.015113451')` -- P999 is a
+single-detector test case, and this query proves that (not just asserts it) by actually checking
+the other two detectors and finding nothing.
+
+**Hybrid Cortex Search -> live obligation + flagged-count pipeline** -- the most complex one:
+describe the conduct in plain English, let Cortex Search rank the matching citations across all
+three jurisdictions, then join each hit to its real approved obligation and (for JP, the only
+jurisdiction with run history) its latest live flagged count:
+```sql
+WITH hit AS (
+    SELECT f.value:CHUNK_ID::VARCHAR AS CHUNK_ID, f.index AS RANK
+    FROM TABLE(FLATTEN(
+        INPUT => PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+            'VIGIL.CORE.RULE_CORPUS_SEARCH',
+            '{"query": "trading without intent to transfer ownership to create false trading activity", "columns": ["CHUNK_ID"], "limit": 3}'
+        )):results
+    )) f
+)
+SELECT hit.RANK, o.JURISDICTION_ID, o.OBLIGATION_ID, r.SECTION_REF, run.FLAGGED_COUNT
+FROM hit
+JOIN RULE_CORPUS_CURRENT r ON r.CHUNK_ID = hit.CHUNK_ID
+JOIN OBLIGATION_RULE_CHUNKS_CURRENT c ON c.RULE_CHUNK_ID = r.CHUNK_ID
+JOIN APPROVED_OBLIGATIONS o ON o.OBLIGATION_ID = c.OBLIGATION_ID AND o.JURISDICTION_ID = c.JURISDICTION_ID
+LEFT JOIN SURVEILLANCE_RUN_LOG run
+    ON run.DETECTOR_NAME = o.DETECTOR_NAME AND run.JURISDICTION_ID = o.JURISDICTION_ID
+    AND run.CREATED_AT = (SELECT MAX(CREATED_AT) FROM SURVEILLANCE_RUN_LOG r2
+                           WHERE r2.DETECTOR_NAME = o.DETECTOR_NAME AND r2.JURISDICTION_ID = o.JURISDICTION_ID)
+ORDER BY hit.RANK;
+```
+Confirmed real result -- the query never once mentioned "wash trading" and correctly surfaced all
+three wash-trading citations, ranked by semantic relevance, each annotated honestly:
+| RANK | JURISDICTION | OBLIGATION | CITATION | FLAGGED_COUNT |
+|---|---|---|---|---|
+| 0 | US | US-WASH-001 | Section 9(a)(1) [15 U.S.C. Sec 78i(a)(1)] | NULL (no US run history) |
+| 1 | JP | JP-WASH-001 | Article 159, Paragraph 1, Item (i) | 28 (real, from the last surveillance run) |
+| 2 | EU | EU-WASH-001 | Article 12(1)(a) and Annex I, Section A(c) | NULL (no EU run history) |
+
+Building this query surfaced a real gap and fixed it in the process:
+`SURVEILLANCE_RUN_LOG` had no `JURISDICTION_ID` column at all (every run to date being Japan-only
+had hidden this), so joining on `DETECTOR_NAME` alone would have silently misattributed JP's
+flagged count to US/EU rows the moment those jurisdictions got their own runs. Fixed 2026-09-15 by
+extracting `PARSE_JSON(OUTPUT):jurisdiction_id` (already written by `SP_LOG_SURVEILLANCE_RUN`,
+just never surfaced as a column) into `SURVEILLANCE_RUN_LOG` and adding a matching
+`RUN.JURISDICTION_ID` dimension to `SV_SURVEILLANCE_AUDIT` -- verified via
+`SELECT * FROM SEMANTIC_VIEW(SV_SURVEILLANCE_AUDIT DIMENSIONS RUN.JURISDICTION_ID METRICS RUN.TOTAL_FLAGGED)`
+returning `('JP', 1424)`. The query above now joins correctly with no jurisdiction guard needed.
+
 ## 5. Presentation surfaces
 
 - **Streamlit (`VIGIL.CORE.VIGIL_DASHBOARD`, Snowsight)** -- 6 tabs: Overview, Trade Surveillance,
