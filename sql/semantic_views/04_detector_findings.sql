@@ -16,6 +16,16 @@
 -- Honesty note: EXECSLIP/ARRSLIP currently have 0 rows for every jurisdiction (TRADE_REFERENCE_
 -- PRICES isn't populated by the synthetic generator -- see docs/sources and NOTES.md) -- a
 -- best-execution question through this tool will honestly come back empty, not fabricated.
+--
+-- COV (WASH_DETECTION_COVERAGE) added 2026-09-15 as a structural fix, not another instruction:
+-- three independent CoCo adversarial-verification passes confirmed an orchestration instruction
+-- telling the agent to "also call trade_surveillance to check for underlying data" is advisory and
+-- unreliable -- the model kept answering "no findings" from WASH/SPOOF/etc. alone without ever
+-- invoking a second tool to check whether a jurisdiction has any trade data at all (see NOTES.md).
+-- COV.TOTAL_TRADES is a real per-jurisdiction/venue/day trade count (COUNT(*) FROM TRADES,
+-- sql/detectors/02_wash_trading.sql) -- exposing it here means the fact "is there any underlying
+-- data" is answerable from the SAME tool call already being made, with no second tool-invocation
+-- decision for the model to skip.
 
 USE ROLE ACCOUNTADMIN;
 USE DATABASE VIGIL;
@@ -28,7 +38,8 @@ CREATE OR REPLACE SEMANTIC VIEW SV_DETECTOR_FINDINGS
         POSLIM AS POSITION_LIMIT_BREACHES PRIMARY KEY (PARTICIPANT_ID, INSTRUMENT_ID, JURISDICTION_ID, AS_OF_DATE) WITH SYNONYMS ('position limit breaches', 'position breaches') COMMENT = 'Row-level net position vs. calibrated limit per participant/instrument/day.',
         RPTSIG AS REPORTING_TIMELINESS_SIGNALS PRIMARY KEY (REPORT_ID, JURISDICTION_ID) WITH SYNONYMS ('reporting timeliness signals', 'late reports') COMMENT = 'Row-level timeliness/completeness/match findings per transaction report.',
         EXECSLIP AS EXECUTION_SLIPPAGE PRIMARY KEY (TRADE_ID) WITH SYNONYMS ('execution slippage') COMMENT = 'Row-level executed price vs. reference price at execution. Empty until TRADE_REFERENCE_PRICES is populated.',
-        ARRSLIP AS ARRIVAL_SLIPPAGE PRIMARY KEY (TRADE_ID) WITH SYNONYMS ('arrival slippage') COMMENT = 'Row-level order price vs. reference price at order arrival. Empty until TRADE_REFERENCE_PRICES is populated.'
+        ARRSLIP AS ARRIVAL_SLIPPAGE PRIMARY KEY (TRADE_ID) WITH SYNONYMS ('arrival slippage') COMMENT = 'Row-level order price vs. reference price at order arrival. Empty until TRADE_REFERENCE_PRICES is populated.',
+        COV AS WASH_DETECTION_COVERAGE PRIMARY KEY (JURISDICTION_ID, VENUE_ID, TRADE_DATE) WITH SYNONYMS ('trade coverage', 'underlying trade volume', 'data availability') COMMENT = 'Real per-jurisdiction/venue/day trade counts (from TRADES directly, not a detector output) -- query this to confirm whether a jurisdiction has any underlying trade data at all before concluding "no findings" means "no data".'
     )
     DIMENSIONS (
         WASH.TRADE_ID_1 AS WASH.TRADE_ID_1,
@@ -70,7 +81,11 @@ CREATE OR REPLACE SEMANTIC VIEW SV_DETECTOR_FINDINGS
 
         ARRSLIP.TRADE_ID AS ARRSLIP.TRADE_ID,
         ARRSLIP.INSTRUMENT_ID AS ARRSLIP.INSTRUMENT_ID,
-        ARRSLIP.JURISDICTION_ID AS ARRSLIP.JURISDICTION_ID
+        ARRSLIP.JURISDICTION_ID AS ARRSLIP.JURISDICTION_ID,
+
+        COV.JURISDICTION_ID AS COV.JURISDICTION_ID,
+        COV.VENUE_ID AS COV.VENUE_ID,
+        COV.TRADE_DATE AS COV.TRADE_DATE
     )
     METRICS (
         WASH.CANDIDATE_COUNT AS COUNT(WASH.TRADE_ID_1) COMMENT = 'Number of wash-trading candidate pairs.',
@@ -92,7 +107,9 @@ CREATE OR REPLACE SEMANTIC VIEW SV_DETECTOR_FINDINGS
         EXECSLIP.AVG_SLIPPAGE_PCT AS AVG(EXECSLIP.EXECUTION_SLIPPAGE_PCT) COMMENT = 'Average execution slippage percentage.',
 
         ARRSLIP.ROW_COUNT AS COUNT(ARRSLIP.TRADE_ID) COMMENT = 'Trades with a checkable arrival reference price (0 until TRADE_REFERENCE_PRICES is populated).',
-        ARRSLIP.AVG_SLIPPAGE_PCT AS AVG(ARRSLIP.ARRIVAL_SLIPPAGE_PCT) COMMENT = 'Average arrival slippage percentage.'
+        ARRSLIP.AVG_SLIPPAGE_PCT AS AVG(ARRSLIP.ARRIVAL_SLIPPAGE_PCT) COMMENT = 'Average arrival slippage percentage.',
+
+        COV.TOTAL_TRADE_VOLUME AS SUM(COV.TOTAL_TRADES) COMMENT = 'Total real trade count for the matching jurisdiction/venue/day(s) -- zero or no rows here means no trade data exists at all, distinct from a detector finding zero flagged rows.'
     )
     COMMENT = 'Row-level detector findings: wash-trading candidates, spoofing/layering signals, position-limit breaches, reporting-timeliness signals, execution/arrival slippage -- not aggregate run counts (that is surveillance_audit) and not raw trade facts (that is trade_surveillance).';
 

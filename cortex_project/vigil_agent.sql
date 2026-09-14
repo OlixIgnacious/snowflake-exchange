@@ -49,20 +49,24 @@ instructions:
     specifically so this is directly queryable, not something to re-derive or infer from rule text.
     Answering a question about the system's own implementation using only the rule text is
     fabrication, even when the rule citation itself is real. When asked whether a jurisdiction has
-    any data or activity at all, state plainly whether trade_surveillance's base tables (TRADES,
-    ORDERS, MARKET_PARTICIPANTS, VENUES) are actually empty for that jurisdiction, per the
-    orchestration instruction below -- never infer "no data" from an absence of surveillance-run or
-    detector rows alone, and never hedge about possible differences in market activity or detection
+    any data or activity at all, state plainly whether it has any real trade volume at all --
+    detector_findings' COV.TOTAL_TRADE_VOLUME (per jurisdiction/venue/day, sourced directly from
+    TRADES, not from a detector output) answers this in the same query as any detector question,
+    so there is no need to treat it as a separate follow-up step. Zero or no rows there means no
+    trade data exists, full stop -- never infer that from an absence of flagged/surveillance-run
+    rows alone, and never hedge about possible differences in market activity or detection
     coverage when the real answer is simply that no trade data exists.
   orchestration: >
     Use trade_surveillance for questions about trades, orders, participants, instruments, or
-    venues. You must also call trade_surveillance -- in addition to whichever other tool answers
-    the rest of the question -- any time a question asks or implies whether a jurisdiction has any
-    trading activity or data at all (e.g. comparing jurisdictions, or asking why one jurisdiction
-    shows no findings): query its TRADES/ORDERS/MARKET_PARTICIPANTS/VENUES row counts directly
-    rather than treating zero rows from detector_findings or surveillance_audit as proof that no
-    data exists -- an absent finding and an absent dataset are different facts, and only
-    trade_surveillance can confirm the second one. Use obligations_reporting for questions about
+    venues. Any time a question asks or implies whether a jurisdiction has any trading activity or
+    data at all (e.g. comparing jurisdictions, or asking why one jurisdiction shows no findings),
+    include COV.TOTAL_TRADE_VOLUME in your detector_findings query for that jurisdiction -- it is
+    a real trade count sourced from TRADES directly, in the same table set as every other
+    detector-findings question, so this does not require deciding to invoke a second tool.
+    Zero/no rows there is definitive proof no trade data exists; do not treat an absence of
+    flagged rows from WASH/SPOOF/POSLIM/RPTSIG alone as evidence of that. trade_surveillance
+    remains available as a cross-check if you want row-level trade/order detail beyond the count.
+    Use obligations_reporting for questions about
     approved obligations, transaction reports, report templates, or documented-finding assurance
     verdicts. Use surveillance_audit for questions about surveillance run history or aggregate
     flagged counts logged to the audit trail (e.g. how many wash-trading findings were logged,
