@@ -119,6 +119,48 @@ JOIN RULE_CORPUS_CURRENT r ON r.CHUNK_ID = c.RULE_CHUNK_ID
 WHERE o.JURISDICTION_ID = 'JP';
 ```
 
+## 4b. Cortex Search -- semantic retrieval over `RULE_CORPUS` (added 2026-09-14)
+
+`RULE_CORPUS_SEARCH` (`sql/cortex_search/01_rule_corpus_search.sql`) indexes `RULE_CORPUS_CURRENT`
+(`CHUNK_TEXT`, `snowflake-arctic-embed-m-v1.5` embeddings, `TARGET_LAG='1 day'`) -- lets a caller
+find the relevant citation by describing the conduct instead of needing the exact `CHUNK_ID`.
+Confirmed real (`ANALYST_READ`, `SNOWFLAKE.CORTEX.SEARCH_PREVIEW`): querying "placing orders and
+cancelling them to create a false impression of market activity" ranks `EU-MAR-12-2C` (EU
+layering/spoofing) first, followed by `US-EXCHACT-9A1`, `EU-MAR-12-1A-ANNEXI-AC`,
+`US-CEA-4C-A5-C`, and `JP-FIEA-159-2-I` -- a real cross-jurisdiction semantic match, not a keyword
+match (none of those chunks contain the word "cancelling").
+
+```sql
+SELECT PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+    'VIGIL.CORE.RULE_CORPUS_SEARCH',
+    '{"query": "<describe the conduct>", "columns": ["CHUNK_ID","JURISDICTION_ID","DOC_TITLE","SECTION_REF"], "limit": 5}'
+));
+```
+
+Not yet wired into the Cortex Agent as a fourth tool (`rule_corpus_search` alongside
+`trade_surveillance`/`obligations_reporting`/`surveillance_audit`) -- a natural next step, not done
+here.
+
+## 4c. Scheduled governance-coverage audit (added 2026-09-15)
+
+`TASK_GOVERNANCE_COVERAGE_AUDIT` (`sql/tasks/02_governance_coverage_audit.sql`, weekly cron) calls
+`SP_AUDIT_OBLIGATION_COVERAGE` (`sql/procedures/sp_audit_obligation_coverage.sql`), which logs one
+`AUDIT_LOG` row per jurisdiction listing which of the five detector families have a real, active
+obligation-to-rule-chunk chain and which don't. **Deliberately created `SUSPENDED`** and left that
+way to avoid ongoing warehouse cost on a demo project -- activate only when actually demoing it:
+
+```sql
+ALTER TASK VIGIL.CORE.TASK_GOVERNANCE_COVERAGE_AUDIT RESUME;   -- activate for the demo
+ALTER TASK VIGIL.CORE.TASK_GOVERNANCE_COVERAGE_AUDIT SUSPEND;  -- deactivate again afterward
+EXECUTE TASK VIGIL.CORE.TASK_GOVERNANCE_COVERAGE_AUDIT;        -- run once on demand, no schedule change
+```
+
+Confirmed real via `EXECUTE TASK` (task remained `suspended` afterward -- proven, not just
+claimed): all three jurisdictions currently show `missing_detectors: []` (full 5/5 coverage).
+**Scope note:** this checks internal mapping drift only -- it does not fetch FSA/JPX/SEC/EUR-Lex
+sites for new or amended source documents (that needs External Access Integration, not enabled in
+this pass -- see the "Known gaps" section above).
+
 ## 5. Presentation surfaces
 
 - **Streamlit (`VIGIL.CORE.VIGIL_DASHBOARD`, Snowsight)** -- 6 tabs: Overview, Trade Surveillance,
@@ -132,19 +174,30 @@ WHERE o.JURISDICTION_ID = 'JP';
 - No natural-language path to row-level detector findings -- only aggregate counts
   (`surveillance_audit`) or raw trade facts (`trade_surveillance`). Closing this would mean a
   fourth Semantic View over the detector views themselves.
-- `RULE_CORPUS`/`OBLIGATION_MAP`/`OBLIGATION_RULE_CHUNKS` are populated as of 2026-09-14 -- five
-  real citations (FIEA Art. 159(1)(i)/159(2)(i)/40-2, OSE Operational Procedures Section IV and
-  III(1-1)), one per detector family, all approved via `SP_APPROVE_OBLIGATION`'s real
-  `INFORMATION_SCHEMA` validation (`sql/governance/01_rule_corpus_and_obligations_seed.sql`; see
-  NOTES.md for source URLs). `REPORT_TEMPLATE_RULE_CHUNKS` is still empty -- citing which exact
-  ordinance/form clause requires a specific report field (e.g. the `Trading_Capacity` gap field)
-  needs the underlying Cabinet Office Ordinance's prescribed form spec, which this pass didn't
-  find a precise citation for; left open rather than forcing an inexact one. Note also that
-  `JP-RPTTIME-001`'s citation is OSE's *large position report* deadline (a real T+1-business-day
-  precedent for the pattern VIGIL implements), not a located citation of Japan's own
-  transaction-report deadline rule specifically -- see that obligation's `OBLIGATION_DESCRIPTION`
-  for the precise scope of the claim.
+- `RULE_CORPUS`/`OBLIGATION_MAP`/`OBLIGATION_RULE_CHUNKS` are populated as of 2026-09-14/15 --
+  fifteen real citations total, five per jurisdiction (`JP`, `US`, `EU`), one per detector family,
+  all approved via `SP_APPROVE_OBLIGATION`'s real `INFORMATION_SCHEMA` validation
+  (`sql/governance/01_*.sql` for Japan, `sql/governance/02_*.sql` for US/EU; see NOTES.md for
+  source URLs and the original PDFs saved in `docs/sources/`). US/EU are governance content only
+  -- no `JURISDICTION_CONFIG`, venues, or synthetic trade data exist for either, so the detector
+  views honestly return 0 rows `WHERE JURISDICTION_ID IN ('US','EU')`; the obligations are real
+  and approved, just currently unexercised. `REPORT_TEMPLATE_RULE_CHUNKS` is still empty for all
+  three jurisdictions -- citing which exact ordinance/form clause requires a specific report field
+  (e.g. Japan's `Trading_Capacity` gap field) needs each regulator's prescribed form spec, which
+  this pass didn't find precise citations for; left open rather than forcing inexact ones. Note
+  also that `JP-RPTTIME-001`'s citation is OSE's *large position report* deadline (a real
+  T+1-business-day precedent for the pattern VIGIL implements), not a located citation of Japan's
+  own transaction-report deadline rule specifically -- see that obligation's
+  `OBLIGATION_DESCRIPTION` for the precise scope of the claim.
 - `DOCUMENTED_FINDINGS_LOG` isn't askable in natural language yet (section 2) -- SQL/CLI only.
 - Best-execution questions are honest but currently uninteresting: 0 of 901 trades have a
   reference price to check against, since `TRADE_REFERENCE_PRICES` isn't populated by the
   synthetic generator.
+- There is no automated pipeline for sourcing regulatory text -- everything in `RULE_CORPUS` was a
+  one-time manual pass (web search -> download PDF -> `pdftotext` -> hand-pick the citable excerpt
+  -> hand-write into a seed SQL file). Snowflake has native building blocks that could automate
+  more of this (External Access Integration for outbound fetches, Cortex Document AI/
+  `PARSE_DOCUMENT` for in-Snowflake extraction, Cortex AISQL for text-to-obligation mapping,
+  Tasks/Streams for scheduled monitoring of source sites) but none of that is wired up -- see
+  `TASK_GOVERNANCE_COVERAGE_AUDIT` below, which deliberately audits *internal* mapping drift, not
+  external source documents, since External Access Integration was not enabled in this pass.
