@@ -7,5 +7,6 @@ TRACKER.md
 NOTES.md
 plan.md
 .cortex/
+.claude/settings.local.json
 data/synthetic/*.csv
 data/processed/*.csv

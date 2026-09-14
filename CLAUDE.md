@@ -14,7 +14,12 @@ This project is a deliberate domain pivot away from a sibling repo (`Praman`, ba
 
 ## SQL execution
 
-SQL runs directly against Snowflake (same account as `Praman`, disjoint `VIGIL.CORE`/`VIGIL.EVAL` schemas), not through a migration tool, and not from a non-interactive agent — DDL/RBAC/grant scripts are written here but executed by a human interactively (mirroring `Praman`'s `NOTES.md` discipline; recreate that file locally if it doesn't exist here yet, since it's gitignored).
+SQL runs directly against Snowflake (same account as `Praman`, disjoint `VIGIL.CORE`/`VIGIL.EVAL` schemas), not through a migration tool. **As of 2026-09-14, Claude may execute DDL/RBAC/grant scripts directly against this account** (revised from the original "human-only, interactive" rule — the user made this change explicitly, after being asked to confirm it as a permanent policy change rather than a one-off). Two things carry over unchanged from the original discipline:
+
+- **Credentials are never committed.** They live in environment variables or a local, gitignored file (`.env` — already in `.gitignore`), never hardcoded in a script or checked into the repo.
+- **Every executed run is logged in `NOTES.md`** (gitignored; recreate locally if it doesn't exist) — script/statement run, timestamp, result. This preserves the audit trail the original human-run discipline existed to guarantee, even though a human is no longer the one typing the statements in.
+
+This does not change anything about the schema's own append-only/milestoning rules (`architecture.md`) — no functional role is ever granted `UPDATE`/`DELETE` on `VIGIL.CORE`, and that stays a property of the grant scripts themselves, not of who executes them.
 
 ## Commands
 
