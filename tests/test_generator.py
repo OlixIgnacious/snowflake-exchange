@@ -118,3 +118,17 @@ def test_positions_never_derived_from_orders_only_trades():
 
     for key, max_pos in max_position_per_key.items():
         assert max_pos <= trade_volume.get(key, 0) + 1e-6
+
+
+def test_transaction_report_deadline_never_falls_on_a_weekend():
+    """Found via live behavioral testing against loaded Snowflake data, not a hypothetical: the
+    original `EXECUTION_TIMESTAMP + timedelta(days=1)` formula put ~27% of deadlines on a
+    Saturday/Sunday, producing 23 false-positive "late" findings out of 82 (28%) once checked
+    against real regulatory-style T+1-*business*-day semantics. _next_business_day_deadline
+    rolls a weekend deadline forward to the following Monday -- this locks that behavior in."""
+    weekend_deadlines = [
+        r for r in TABLES["TRANSACTION_REPORTS"] if r["DEADLINE"].weekday() >= 5
+    ]
+    assert weekend_deadlines == [], (
+        f"{len(weekend_deadlines)} TRANSACTION_REPORTS rows have a DEADLINE on a weekend"
+    )

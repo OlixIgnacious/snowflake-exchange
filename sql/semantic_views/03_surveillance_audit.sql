@@ -18,7 +18,8 @@ CREATE OR REPLACE SEMANTIC VIEW SV_SURVEILLANCE_AUDIT
     )
     METRICS (
         RUN.RUN_COUNT AS COUNT(RUN.RUN_ID) COMMENT = 'Number of detector-level audit rows.',
-        RUN.TOTAL_FLAGGED AS SUM(RUN.FLAGGED_COUNT) COMMENT = 'Sum of normalized flagged counts across matching rows.'
+        RUN.TOTAL_FLAGGED AS SUM(RUN.FLAGGED_COUNT) COMMENT = 'Sum of normalized flagged counts across matching rows.',
+        RUN.LAST_RUN_AT AS MAX(RUN.CREATED_AT) COMMENT = 'Timestamp of the most recent surveillance run in the matching rows -- any count for an in-progress day is only current as of this timestamp, not a final total, since more scheduled runs may still occur before the day ends.'
     )
     COMMENT = 'Surveillance audit trail: detector run history with normalized flagged counts per detector.';
 

@@ -21,6 +21,21 @@ def _rand_datetime(rng: random.Random, start: date, end: date) -> datetime:
     return datetime(d.year, d.month, d.day, rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59))
 
 
+def _next_business_day_deadline(execution_ts: datetime) -> datetime:
+    """Regulatory reporting deadlines are conventionally T+1 *business* day, not T+1 calendar
+    day -- a real gap found via live behavioral testing: the previous `+ timedelta(days=1)`
+    formula put ~27% of deadlines on a Saturday/Sunday, which independently re-checking against
+    the loaded data showed produced 23 false-positive "late" findings out of 82 (28%) once
+    weekend deadlines are correctly rolled to the following Monday. Deliberately weekend-only,
+    not a full market-holiday calendar -- a real holiday calendar is jurisdiction-specific data
+    that needs the same live-verification discipline `architecture.md` already applies to venue
+    lists (see the US JURISDICTION_CONFIG backlog item), not something to fabricate here."""
+    deadline = execution_ts + timedelta(days=1)
+    while deadline.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        deadline += timedelta(days=1)
+    return deadline
+
+
 def _venue_window(v: VenueSeed, cfg: JurisdictionConfig) -> tuple[date, date]:
     start = v.active_from or cfg.sim_start
     # architecture.md's build order requires timestamps strictly BEFORE DISCONTINUED_AT (not
@@ -277,7 +292,7 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
 
     # --- TRANSACTION_REPORTS: one per trade, some deliberately late ---
     for i, t in enumerate(tables["TRADES"]):
-        deadline = t["EXECUTION_TIMESTAMP"] + timedelta(days=1)
+        deadline = _next_business_day_deadline(t["EXECUTION_TIMESTAMP"])
         late = (i % 11 == 0)
         submitted = deadline + timedelta(hours=6) if late else t["EXECUTION_TIMESTAMP"] + timedelta(hours=2)
         tables["TRANSACTION_REPORTS"].append({

@@ -37,6 +37,11 @@ instructions:
     answer must be accompanied by its WASH_DETECTION_COVERAGE figure so "no wash trades found"
     is never presented the same as "no wash trades could be checked for". Every obligation you
     reference must come from APPROVED_OBLIGATIONS, never a proposed-but-unapproved mapping.
+    Any count from surveillance_audit that covers "today" or another still-ongoing period is a
+    snapshot as of the most recent surveillance run, not a final total -- always query
+    LAST_RUN_AT alongside the count and state the answer "as of <LAST_RUN_AT>", and note that
+    further scheduled runs may add more findings before the period ends. Never imply a same-day
+    count is complete or final.
   orchestration: >
     Use trade_surveillance for questions about trades, orders, participants, instruments, or
     venues. Use obligations_reporting for questions about approved obligations, transaction
