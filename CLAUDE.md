@@ -23,4 +23,15 @@ This does not change anything about the schema's own append-only/milestoning rul
 
 ## Commands
 
-Not yet established — no generator, tests, or ingestion scripts exist yet. This section should be filled in as `uv`/Python tooling is added, following the same pattern as `Praman`'s `CLAUDE.md`.
+Python tooling lives in a `.venv` (created with Homebrew's `python@3.12`, not the system Python
+3.9 — that one can't build `snowflake-connector-python` from source, see `TRACKER.md`).
+
+- Run any SQL file(s) against `VIGIL.CORE`: `.venv/bin/python3 scripts/run_sql.py <file.sql> ...`
+- Connectivity check only: `.venv/bin/python3 scripts/run_sql.py --check`
+- Live RBAC verification (positive+negative checks per role): `.venv/bin/python3 scripts/verify_rbac.py`
+- Run the test suite (generator acceptance criteria, report adaptor, skills — no Snowflake needed): `.venv/bin/python3 -m pytest`
+- Generate synthetic data in-memory: `from generator.generate import generate; from generator.jurisdiction_config import JAPAN_CONFIG`
+- Load synthetic data into Snowflake: `.venv/bin/python3 generator/load_to_snowflake.py`
+
+Connection config (account/user/role/warehouse/private-key path) lives in `.env` (gitignored);
+the private key itself lives outside the repo entirely, in `~/.snowflake/`.

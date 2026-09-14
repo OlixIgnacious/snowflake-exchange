@@ -1,0 +1,18 @@
+[project]
+name = "vigil"
+version = "0.1.0"
+description = "Vigil -- exchange regulatory reporting and surveillance"
+requires-python = ">=3.12"
+dependencies = [
+    "snowflake-connector-python>=3.12",
+    "python-dotenv>=1.0",
+    "cryptography>=42.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

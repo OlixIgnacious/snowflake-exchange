@@ -1,0 +1,35 @@
+-- Semantic View over the trade-surveillance domain object: trades, current orders,
+-- participants, instruments, venues. Spec: architecture.md build order step 5 ("Semantic Views
+-- over the core tables"), reusing Praman's "Semantic-View-per-domain-object" pattern.
+
+USE ROLE ACCOUNTADMIN;
+USE DATABASE VIGIL;
+USE SCHEMA CORE;
+
+CREATE OR REPLACE SEMANTIC VIEW SV_TRADE_SURVEILLANCE
+    TABLES (
+        TRD AS TRADES PRIMARY KEY (TRADE_ID, VENUE_ID) WITH SYNONYMS ('trades') COMMENT = 'Executed trades, immutable once printed.',
+        PART AS MARKET_PARTICIPANTS_CURRENT PRIMARY KEY (PARTICIPANT_ID, JURISDICTION_ID) WITH SYNONYMS ('participants', 'brokers'),
+        INSTR AS INSTRUMENTS_CURRENT PRIMARY KEY (INSTRUMENT_ID, JURISDICTION_ID) WITH SYNONYMS ('instruments'),
+        VEN AS VENUES_CURRENT PRIMARY KEY (VENUE_ID) WITH SYNONYMS ('venues', 'exchanges')
+    )
+    RELATIONSHIPS (
+        TRD_TO_PART AS TRD (PARTICIPANT_ID, JURISDICTION_ID) REFERENCES PART (PARTICIPANT_ID, JURISDICTION_ID),
+        TRD_TO_INSTR AS TRD (INSTRUMENT_ID, JURISDICTION_ID) REFERENCES INSTR (INSTRUMENT_ID, JURISDICTION_ID),
+        TRD_TO_VEN AS TRD (VENUE_ID) REFERENCES VEN (VENUE_ID)
+    )
+    DIMENSIONS (
+        TRD.EXECUTION_DATE AS DATE(TRD.EXECUTION_TIMESTAMP),
+        TRD.MATCHING_MECHANISM AS TRD.MATCHING_MECHANISM,
+        PART.PARTICIPANT_TYPE AS PART.PARTICIPANT_TYPE,
+        INSTR.INSTRUMENT_TYPE AS INSTR.INSTRUMENT_TYPE,
+        VEN.VENUE_TYPE AS VEN.VENUE_TYPE
+    )
+    METRICS (
+        TRD.TOTAL_VOLUME AS SUM(TRD.VOLUME) COMMENT = 'Total traded volume.',
+        TRD.TRADE_COUNT AS COUNT(TRD.TRADE_ID) COMMENT = 'Number of trade prints.',
+        TRD.AVG_PRICE AS AVG(TRD.PRICE) COMMENT = 'Average execution price.'
+    )
+    COMMENT = 'Trade surveillance domain: trades joined to participants, instruments, and venues.';
+
+GRANT SELECT ON SEMANTIC VIEW SV_TRADE_SURVEILLANCE TO ROLE ANALYST_READ;
