@@ -20,9 +20,14 @@ CREATE OR REPLACE AGENT VIGIL_SURVEILLANCE_AGENT
     FROM SPECIFICATION
 $$
 models:
-  orchestration: llama3.1-8b
+  orchestration: claude-haiku-4-5
+  # llama3.1-8b (the original pin) is not an allowed model for the Agent Run API ("Snowflake
+  # Intelligence mode") -- confirmed via a live :run call, which is how this gap was actually
+  # found (SHOW/DESCRIBE AGENT never surfaces it, only a real orchestration call does).
+  # claude-haiku-4-5 is the smallest/cheapest model on the account's allowed list, preserving the
+  # original cost-conscious intent below without being a frontier/top-costing model.
   # Deliberately not a frontier/top-costing model: this agent's orchestration job is routing
-  # between two tools and drafting templated responses from their SQL results, not open-ended
+  # between three tools and drafting templated responses from their SQL results, not open-ended
   # reasoning -- a small model is the right cost/capability match for that task. Revisit only if
   # real usage shows routing accuracy actually suffers.
 instructions:
@@ -35,7 +40,10 @@ instructions:
   orchestration: >
     Use trade_surveillance for questions about trades, orders, participants, instruments, or
     venues. Use obligations_reporting for questions about approved obligations, transaction
-    reports, or report templates. Do not answer from memory -- always query.
+    reports, or report templates. Use surveillance_audit for questions about surveillance run
+    history or detector findings logged to the audit trail (e.g. how many wash-trading findings
+    were logged, which detector flagged the most items, when a run last executed). Do not answer
+    from memory -- always query.
 tools:
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
@@ -45,11 +53,26 @@ tools:
       type: "cortex_analyst_text_to_sql"
       name: "obligations_reporting"
       description: "Query approved regulatory obligations, transaction reports, and report templates."
+  - tool_spec:
+      type: "cortex_analyst_text_to_sql"
+      name: "surveillance_audit"
+      description: "Query the surveillance audit trail -- detector run history and normalized flagged counts per run."
 tool_resources:
   trade_surveillance:
     semantic_view: "VIGIL.CORE.SV_TRADE_SURVEILLANCE"
+    execution_environment:
+      type: "warehouse"
+      warehouse: "COMPUTE_WH"
   obligations_reporting:
     semantic_view: "VIGIL.CORE.SV_OBLIGATIONS_REPORTING"
+    execution_environment:
+      type: "warehouse"
+      warehouse: "COMPUTE_WH"
+  surveillance_audit:
+    semantic_view: "VIGIL.CORE.SV_SURVEILLANCE_AUDIT"
+    execution_environment:
+      type: "warehouse"
+      warehouse: "COMPUTE_WH"
 $$;
 
 GRANT USAGE ON AGENT VIGIL_SURVEILLANCE_AGENT TO ROLE ANALYST_READ;
