@@ -32,15 +32,24 @@ oversight -- see the file's own header comment). `LATE_COUNT` uses the business-
 deadline (fixed 2026-09-14 to agree with `surveillance_audit` below -- see NOTES.md for the
 cross-tool inconsistency this closed).
 
+`APPROVED_OBLIGATIONS`/`RULE_CORPUS` were empty backlog items until 2026-09-14 (see NOTES.md) --
+now populated with five real citations, one per detector family, fetched live from the FSA's own
+English translation of the Financial Instruments and Exchange Act and Osaka Exchange's own
+Operational Procedures document (`sql/governance/01_rule_corpus_and_obligations_seed.sql`; both
+are Japan's own primary sources, marked `SOURCE_AUTHORITY='translation'` per architecture.md's
+design rule #6 since the legally authoritative text is Japanese).
+
 | You could ask | Confirmed real answer |
 |---|---|
 | "How many transaction reports are late?" | 59 (business-day-adjusted; was incorrectly 82 before the weekend-deadline fix) |
 | "How many required fields does the transaction_report template have, mapped vs. gap?" | `mapped`: 3; `gap`: 1 (`Trading_Capacity` -- a real required field with no current data source, surfaced not hidden, per Fix #28) |
 | "How many reports are in 'new' status?" | 901 |
+| "Which detectors have an approved obligation mapping?" | `best_execution`, `position_limit`, `spoofing_layering`, `reporting_timeliness`, `wash_trading` -- all five detector families now have one |
 
-**Not answerable yet:** "which obligations have no approved mapping" -- `APPROVED_OBLIGATIONS` is
-empty (0 rows; `OBLIGATION_MAP`/`RULE_CORPUS` are unpopulated backlog items), so any question
-about specific obligations will come back empty, honestly, not fabricated.
+**Still not answerable in natural language:** which *rule chunk* backs a given obligation --
+`SV_OBLIGATIONS_REPORTING` doesn't declare `RULE_CORPUS`/`OBLIGATION_RULE_CHUNKS` as tables, so
+that join isn't reachable through the agent yet. Use section 3's `run_rule_gap_analysis.py` or the
+direct SQL in section 4 for that.
 
 ### `surveillance_audit` -- `SV_SURVEILLANCE_AUDIT`
 The scheduled-run audit trail (`SP_LOG_SURVEILLANCE_RUN` → `AUDIT_LOG` →
@@ -79,7 +88,7 @@ count `surveillance_audit` gives you.
 |---|---|---|
 | `assure_report` | `.venv/bin/python3 scripts/generate_documented_findings.py --jurisdiction JP --report-type transaction_report` | Live: pulls every currently-flagged `TRANSACTION_REPORTS` row, calls `assure_report.assure()` against real data, writes a real verdict to `DOCUMENTED_FINDINGS_LOG`. |
 | `surveillance_query` | `python3 -c "from skills.surveillance_query import *; print(build_query(SurveillanceQueryRequest('wash_trading', 'JP')))"` | Builds the `SELECT` string for a detector view + its companion coverage query (Fix #3) -- does not execute it itself (by design); pipe the string into `scripts/run_sql.py` or a SQL client. |
-| `rule_interpret` | Import-only today (`from skills.rule_interpret import find_gaps`) -- no CLI entry point yet, and `OBLIGATION_MAP`/`RULE_CORPUS` are empty, so there's nothing real to run it against until both exist. CLI wrapper in progress (CoCo). | Set-difference gap analysis: which detector-backed concepts a rule chunk requires vs. what's already `APPROVED_OBLIGATIONS`. |
+| `rule_interpret` | `.venv/bin/python3 scripts/run_rule_gap_analysis.py --jurisdiction JP --rule-chunk-id JP-FIEA-159-1-I --required-concepts wash_trading,circuit_breaker_compliance` | Live: reads the real `RULE_CORPUS` chunk + `APPROVED_OBLIGATIONS` coverage, runs the actual set-difference gap analysis. Confirmed real: 0 gaps when asked only about `wash_trading` (already approved); 1 gap (`circuit_breaker_compliance`) when a concept with no obligation mapping is added -- both outcomes real, not illustrative. |
 | `narrative_draft` | Import-only today -- no CLI entry point yet. CLI wrapper in progress (CoCo). | Walks an `AUDIT_LOG` sign-off lineage chain, renders a plain-language narrative. Real, live rows exist to walk now (`SP_LOG_SURVEILLANCE_RUN`'s output), just no wrapper to invoke it from a terminal yet. |
 
 ## 4. Direct SQL -- detector views (row-level detail, `ANALYST_READ`)
@@ -100,6 +109,14 @@ SELECT * FROM POSITION_LIMIT_BREACHES WHERE IS_BREACH;
 -- Reporting timeliness, with the business-day-adjusted effective deadline visible
 SELECT REPORT_ID, DEADLINE, EFFECTIVE_DEADLINE, IS_LATE_SUBMISSION
 FROM REPORTING_TIMELINESS_SIGNALS WHERE IS_LATE_SUBMISSION;
+
+-- Which real rule text backs each detector's obligation (added 2026-09-14 -- see NOTES.md)
+SELECT o.OBLIGATION_ID, o.DETECTOR_NAME, r.DOC_TITLE, r.SECTION_REF, r.CHUNK_TEXT
+FROM APPROVED_OBLIGATIONS o
+JOIN OBLIGATION_RULE_CHUNKS_CURRENT c
+    ON c.OBLIGATION_ID = o.OBLIGATION_ID AND c.JURISDICTION_ID = o.JURISDICTION_ID
+JOIN RULE_CORPUS_CURRENT r ON r.CHUNK_ID = c.RULE_CHUNK_ID
+WHERE o.JURISDICTION_ID = 'JP';
 ```
 
 ## 5. Presentation surfaces
@@ -115,9 +132,18 @@ FROM REPORTING_TIMELINESS_SIGNALS WHERE IS_LATE_SUBMISSION;
 - No natural-language path to row-level detector findings -- only aggregate counts
   (`surveillance_audit`) or raw trade facts (`trade_surveillance`). Closing this would mean a
   fourth Semantic View over the detector views themselves.
-- `rule_interpret`/`obligations_reporting`'s obligation questions have nothing real to answer
-  against yet -- `OBLIGATION_MAP`, `RULE_CORPUS`, `REPORT_TEMPLATE_RULE_CHUNKS` are all empty
-  (real FSA/SESC rule-text sourcing is an explicit `plan.md` backlog item).
+- `RULE_CORPUS`/`OBLIGATION_MAP`/`OBLIGATION_RULE_CHUNKS` are populated as of 2026-09-14 -- five
+  real citations (FIEA Art. 159(1)(i)/159(2)(i)/40-2, OSE Operational Procedures Section IV and
+  III(1-1)), one per detector family, all approved via `SP_APPROVE_OBLIGATION`'s real
+  `INFORMATION_SCHEMA` validation (`sql/governance/01_rule_corpus_and_obligations_seed.sql`; see
+  NOTES.md for source URLs). `REPORT_TEMPLATE_RULE_CHUNKS` is still empty -- citing which exact
+  ordinance/form clause requires a specific report field (e.g. the `Trading_Capacity` gap field)
+  needs the underlying Cabinet Office Ordinance's prescribed form spec, which this pass didn't
+  find a precise citation for; left open rather than forcing an inexact one. Note also that
+  `JP-RPTTIME-001`'s citation is OSE's *large position report* deadline (a real T+1-business-day
+  precedent for the pattern VIGIL implements), not a located citation of Japan's own
+  transaction-report deadline rule specifically -- see that obligation's `OBLIGATION_DESCRIPTION`
+  for the precise scope of the claim.
 - `DOCUMENTED_FINDINGS_LOG` isn't askable in natural language yet (section 2) -- SQL/CLI only.
 - Best-execution questions are honest but currently uninteresting: 0 of 901 trades have a
   reference price to check against, since `TRADE_REFERENCE_PRICES` isn't populated by the
