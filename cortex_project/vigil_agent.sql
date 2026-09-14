@@ -45,10 +45,18 @@ instructions:
   orchestration: >
     Use trade_surveillance for questions about trades, orders, participants, instruments, or
     venues. Use obligations_reporting for questions about approved obligations, transaction
-    reports, or report templates. Use surveillance_audit for questions about surveillance run
-    history or detector findings logged to the audit trail (e.g. how many wash-trading findings
-    were logged, which detector flagged the most items, when a run last executed). Do not answer
-    from memory -- always query.
+    reports, report templates, or documented-finding assurance verdicts. Use surveillance_audit
+    for questions about surveillance run history or aggregate flagged counts logged to the audit
+    trail (e.g. how many wash-trading findings were logged, which detector flagged the most
+    items, when a run last executed). Use detector_findings for questions asking for the actual
+    flagged rows themselves -- specific participants, instruments, or dates -- not just a count
+    (e.g. "show me the wash-trading candidates for participant X", "which positions breached
+    their limit"). Use rule_search when the question describes conduct or a rule in plain
+    language rather than naming an exact obligation or citation (e.g. "what rule covers orders
+    placed and cancelled to create a false impression of activity") -- then cross-reference the
+    result against obligations_reporting/detector_findings for the live obligation and any
+    flagged rows, rather than answering from the citation text alone. Do not answer from memory
+    -- always query.
 tools:
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
@@ -57,11 +65,19 @@ tools:
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
       name: "obligations_reporting"
-      description: "Query approved regulatory obligations, transaction reports, and report templates."
+      description: "Query approved regulatory obligations, transaction reports, report templates, and documented-finding assurance verdicts."
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
       name: "surveillance_audit"
       description: "Query the surveillance audit trail -- detector run history and normalized flagged counts per run."
+  - tool_spec:
+      type: "cortex_analyst_text_to_sql"
+      name: "detector_findings"
+      description: "Query the actual row-level detector findings -- wash-trading candidates, spoofing/layering signals, position-limit breaches, reporting-timeliness signals, and execution/arrival slippage -- not aggregate counts."
+  - tool_spec:
+      type: "cortex_search"
+      name: "rule_search"
+      description: "Semantic search over the real regulatory rule text (RULE_CORPUS) backing each detector obligation, across Japan, US, and EU sources -- use when the question describes conduct or asks what rule applies, rather than naming an exact citation."
 tool_resources:
   trade_surveillance:
     semantic_view: "VIGIL.CORE.SV_TRADE_SURVEILLANCE"
@@ -78,6 +94,16 @@ tool_resources:
     execution_environment:
       type: "warehouse"
       warehouse: "COMPUTE_WH"
+  detector_findings:
+    semantic_view: "VIGIL.CORE.SV_DETECTOR_FINDINGS"
+    execution_environment:
+      type: "warehouse"
+      warehouse: "COMPUTE_WH"
+  rule_search:
+    name: "VIGIL.CORE.RULE_CORPUS_SEARCH"
+    max_results: 5
+    id_column: "CHUNK_ID"
+    title_column: "SECTION_REF"
 $$;
 
 GRANT USAGE ON AGENT VIGIL_SURVEILLANCE_AGENT TO ROLE ANALYST_READ;

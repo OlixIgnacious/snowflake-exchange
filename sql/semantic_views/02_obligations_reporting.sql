@@ -10,20 +10,27 @@ CREATE OR REPLACE SEMANTIC VIEW SV_OBLIGATIONS_REPORTING
     TABLES (
         OBL AS APPROVED_OBLIGATIONS PRIMARY KEY (OBLIGATION_ID, JURISDICTION_ID) WITH SYNONYMS ('obligations') COMMENT = 'Latest approved obligation-to-detector mappings only.',
         RPT AS TRANSACTION_REPORTS_CURRENT PRIMARY KEY (REPORT_ID, JURISDICTION_ID) WITH SYNONYMS ('reports', 'transaction reports'),
-        TMPL AS REPORT_TEMPLATES_CURRENT PRIMARY KEY (JURISDICTION_ID, REPORT_TYPE, FIELD_NAME) WITH SYNONYMS ('report templates', 'required fields')
+        TMPL AS REPORT_TEMPLATES_CURRENT PRIMARY KEY (JURISDICTION_ID, REPORT_TYPE, FIELD_NAME) WITH SYNONYMS ('report templates', 'required fields'),
+        DFL AS DOCUMENTED_FINDINGS_LOG PRIMARY KEY (RUN_ID) WITH SYNONYMS ('documented findings', 'assurance verdicts', 'report assurance') COMMENT = 'Real per-report assurance verdicts from assure_report.py via scripts/generate_documented_findings.py -- added 2026-09-15 to close the "DOCUMENTED_FINDINGS_LOG isn''t askable in natural language" gap.'
     )
     -- No RELATIONSHIPS clause: REPORT_TEMPLATES_CURRENT's real key is (JURISDICTION_ID,
     -- REPORT_TYPE, FIELD_NAME) -- one row per required FIELD, not per report type -- so a report
     -- doesn't join to exactly one TMPL row the way a Semantic View relationship requires (the
     -- referenced side's full PK/unique key). TMPL and RPT stay independent tables in this view,
     -- queried separately; REPORT_TEMPLATE_COVERAGE (sql/detectors/) is the per-report-type
-    -- aggregate that actually relates the two conceptually.
+    -- aggregate that actually relates the two conceptually. DFL carries REPORT_ID but no
+    -- JURISDICTION_ID column (see sql/detectors/07_surveillance_audit_log.sql), so it can't
+    -- satisfy RPT's full (REPORT_ID, JURISDICTION_ID) key either -- independent table, same as
+    -- TMPL, for the same real-modeling-constraint reason, not an oversight.
     DIMENSIONS (
         RPT.REPORT_STATUS AS RPT.REPORT_STATUS,
         RPT.REPORT_SCOPE AS RPT.REPORT_SCOPE,
         RPT.MATCH_STATUS AS RPT.MATCH_STATUS,
         TMPL.FIELD_STATUS AS TMPL.STATUS,
-        OBL.DETECTOR_NAME AS OBL.DETECTOR_NAME
+        OBL.DETECTOR_NAME AS OBL.DETECTOR_NAME,
+        DFL.REPORT_ID AS DFL.REPORT_ID,
+        DFL.READY_TO_SUBMIT AS DFL.READY_TO_SUBMIT WITH SYNONYMS ('ready to submit'),
+        DFL.FIELDS_COMPLETE AS DFL.FIELDS_COMPLETE
     )
     METRICS (
         RPT.REPORT_COUNT AS COUNT(RPT.REPORT_ID) COMMENT = 'Number of transaction reports.',
@@ -41,7 +48,9 @@ CREATE OR REPLACE SEMANTIC VIEW SV_OBLIGATIONS_REPORTING
                 WHEN 7 THEN DATEADD(day, 1, RPT.DEADLINE)
                 ELSE RPT.DEADLINE
             END) COMMENT = 'Reports submitted after their effective (business-day-adjusted) deadline.',
-        TMPL.REQUIRED_FIELD_COUNT AS COUNT_IF(TMPL.IS_REQUIRED) COMMENT = 'Required fields for a report type.'
+        TMPL.REQUIRED_FIELD_COUNT AS COUNT_IF(TMPL.IS_REQUIRED) COMMENT = 'Required fields for a report type.',
+        DFL.FINDING_COUNT AS COUNT(DFL.RUN_ID) COMMENT = 'Number of documented-finding assurance verdicts logged.',
+        DFL.READY_COUNT AS COUNT_IF(DFL.READY_TO_SUBMIT) COMMENT = 'Verdicts where the report was assessed ready to submit.'
     )
     COMMENT = 'Governance/reporting domain: approved obligations, transaction reports, report templates.';
 

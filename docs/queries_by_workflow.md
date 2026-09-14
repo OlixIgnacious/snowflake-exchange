@@ -9,9 +9,20 @@ be trusted, not aspirational.
 
 ## 1. Ask `VIGIL_SURVEILLANCE_AGENT` (natural language)
 
-Three tools, each backed by one Semantic View, each with a genuinely different scope. The agent
-picks the tool; you can also address a tool's underlying Semantic View directly via
-`SELECT * FROM SEMANTIC_VIEW(...)` if you want the exact query instead of a chat answer.
+Five tools as of 2026-09-15: four Semantic Views (`trade_surveillance`, `obligations_reporting`,
+`surveillance_audit`, `detector_findings`) plus one Cortex Search service (`rule_search`), each
+with a genuinely different scope. The agent picks the tool; you can also address a Semantic-View
+tool's underlying view directly via `SELECT * FROM SEMANTIC_VIEW(...)`, or the search tool via
+`SNOWFLAKE.CORTEX.SEARCH_PREVIEW(...)`, if you want the exact query instead of a chat answer.
+
+**Verification caveat, stated plainly:** every number below was confirmed via direct SQL against
+the same Semantic Views/search service the agent uses (`DESCRIBE AGENT` also confirms the live
+spec matches this file byte-for-byte). What is *not* independently confirmed from this side is
+that the agent's own LLM orchestration actually picks the right tool for a given natural-language
+question in a live chat turn -- that needs the Agent Run API, which isn't reachable from here (see
+NOTES.md; CoCo has done this kind of live `:run` check in earlier passes). Treat "the tool answers
+this correctly when queried directly" and "the agent will route to it correctly in chat" as two
+separate claims until the second one is actually checked.
 
 ### `trade_surveillance` -- `SV_TRADE_SURVEILLANCE`
 Raw trade facts only -- volume, count, average price -- sliced by execution date, matching
@@ -45,11 +56,13 @@ design rule #6 since the legally authoritative text is Japanese).
 | "How many required fields does the transaction_report template have, mapped vs. gap?" | `mapped`: 3; `gap`: 1 (`Trading_Capacity` -- a real required field with no current data source, surfaced not hidden, per Fix #28) |
 | "How many reports are in 'new' status?" | 901 |
 | "Which detectors have an approved obligation mapping?" | `best_execution`, `position_limit`, `spoofing_layering`, `reporting_timeliness`, `wash_trading` -- all five detector families now have one |
+| "How many documented-finding verdicts are ready to submit?" | 124 of 124 (added 2026-09-15 -- `DOCUMENTED_FINDINGS_LOG` is now a 4th table, `DFL`, in this same Semantic View) |
 
 **Still not answerable in natural language:** which *rule chunk* backs a given obligation --
 `SV_OBLIGATIONS_REPORTING` doesn't declare `RULE_CORPUS`/`OBLIGATION_RULE_CHUNKS` as tables, so
-that join isn't reachable through the agent yet. Use section 3's `run_rule_gap_analysis.py` or the
-direct SQL in section 4 for that.
+that join isn't reachable through this tool. Use the new `rule_search` tool below,
+`detector_findings` below, `run_rule_gap_analysis.py` (section 3), or the direct SQL in section 4d
+for that.
 
 ### `surveillance_audit` -- `SV_SURVEILLANCE_AUDIT`
 The scheduled-run audit trail (`SP_LOG_SURVEILLANCE_RUN` → `AUDIT_LOG` →
@@ -63,8 +76,42 @@ agent's instructions (added 2026-09-14) -- a count here is a snapshot, not a fin
 | "How many best-execution checks found a usable reference price?" | 0 of 901 -- `TRADE_REFERENCE_PRICES` isn't populated by the synthetic generator, surfaced as a coverage gap, not silently skipped |
 | "When did the last surveillance run happen?" | 2026-09-14 (date-grain only -- a known Semantic View limitation, not full timestamp precision) |
 
-**Not answerable yet:** row-level detail ("show me the actual wash-trading candidate trades") --
-this tool only has aggregate counts. For that, use section 3 or 4 below.
+**Fixed 2026-09-15:** row-level detail ("show me the actual wash-trading candidate trades") is now
+answerable -- via the new `detector_findings` tool immediately below, not this one (this tool
+stays aggregate-only by design; the two are deliberately separate tools, not one merged view).
+
+### `detector_findings` -- `SV_DETECTOR_FINDINGS` (added 2026-09-15)
+The actual flagged rows themselves -- wash-trading candidate pairs, spoofing/layering signal-days,
+position-limit breach days, reporting-timeliness signals, execution/arrival slippage -- as six
+independent tables (same "genuinely unrelated keys" situation as `obligations_reporting`; no
+`RELATIONSHIPS` between them). This is the tool that closes the "no natural-language path to
+row-level detector findings" gap -- previously the only options were an aggregate count
+(`surveillance_audit`) or raw trade facts with no findings at all (`trade_surveillance`).
+
+| You could ask | Confirmed real answer |
+|---|---|
+| "Show me the wash-trading candidates for participant P030, with instrument and exemption status" | Real rows, e.g. `(P030, P001, I07, exempt=False)`, `(P005, P025, I00, exempt=False)` -- actual pairs, not a count |
+| "Which position limit breaches happened, and by how much?" | One real row: `P011, I05, 2026-07-31, 101.8% of limit` |
+| "Show me participant P999's spoofing signal history by date, flagged or not" | 15 real daily rows, cancel-ratio z-score per day, correctly showing `IS_FLAGGED=True` only for 2025-07-04 (z-score 3.02) -- the rest unflagged, including several with no z-score at all (not enough baseline history yet) |
+
+**Honesty note:** the two slippage tables (`EXECSLIP`/`ARRSLIP`) will honestly return 0 rows for
+every question -- `TRADE_REFERENCE_PRICES` isn't populated by the synthetic generator, so
+best-execution has nothing to check row-level detail against yet, same gap as `surveillance_audit`
+above. This tool doesn't hide that; it surfaces it as an empty, real result.
+
+### `rule_search` -- `RULE_CORPUS_SEARCH` (Cortex Search, added 2026-09-15)
+Semantic search over all 15 real rule citations (5 detectors x 3 jurisdictions -- JP/US/EU) --
+answers "what rule covers this conduct" without needing to already know the exact citation or
+`CHUNK_ID`. Backed by `snowflake-arctic-embed-m-v1.5` embeddings, not keyword matching.
+
+| You could ask | Confirmed real answer |
+|---|---|
+| "What rule covers placing orders and then cancelling them to make the market look more active than it is?" | Top hit: EU MAR Article 12(2)(c) (layering/spoofing); also surfaces US Exchange Act 9(a)(1), EU Annex I Section A(c), US CEA 4c(a)(5)(C), and JP FIEA 159(2)(i) in the top 5 -- a real cross-jurisdiction semantic match, not a keyword hit (none of those chunks contain the word "cancelling") |
+
+Cross-referencing a `rule_search` hit against `obligations_reporting`/`detector_findings` for the
+live obligation and any actual flagged rows (rather than answering from the citation text alone)
+is the agent's own orchestration instruction, not something this tool does by itself -- see
+`cortex_project/vigil_agent.sql`.
 
 ## 2. `DOCUMENTED_FINDINGS_LOG` -- real per-report assurance verdicts
 
@@ -137,9 +184,12 @@ SELECT PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
 ));
 ```
 
-Not yet wired into the Cortex Agent as a fourth tool (`rule_corpus_search` alongside
-`trade_surveillance`/`obligations_reporting`/`surveillance_audit`) -- a natural next step, not done
-here.
+**Wired into the Cortex Agent as of 2026-09-15** -- the `rule_search` tool (section 1 above),
+alongside a new `detector_findings` tool for row-level findings. `DESCRIBE AGENT
+VIGIL_SURVEILLANCE_AGENT` confirms the live spec matches `cortex_project/vigil_agent.sql` exactly.
+Not independently confirmed from this side: that the agent's own orchestration actually routes to
+`rule_search`/`detector_findings` correctly in a live chat turn (needs the Agent Run API, not
+reachable here) -- see section 1's verification caveat.
 
 ## 4c. Scheduled governance-coverage audit (added 2026-09-15)
 
@@ -302,9 +352,12 @@ returning `('JP', 1424)`. The query above now joins correctly with no jurisdicti
 
 ## Known gaps in "what can be asked" (surfaced, not hidden)
 
-- No natural-language path to row-level detector findings -- only aggregate counts
-  (`surveillance_audit`) or raw trade facts (`trade_surveillance`). Closing this would mean a
-  fourth Semantic View over the detector views themselves.
+- ~~No natural-language path to row-level detector findings~~ -- FIXED 2026-09-15: the
+  `detector_findings` tool (`SV_DETECTOR_FINDINGS`, section 1) exposes wash-trading candidates,
+  spoofing signals, position-limit breaches, reporting-timeliness signals, and execution/arrival
+  slippage at real row-level granularity. Not yet independently confirmed: live agent-chat routing
+  to this tool (see section 1's verification caveat -- confirmed via direct SQL, not a live `:run`
+  call).
 - `RULE_CORPUS`/`OBLIGATION_MAP`/`OBLIGATION_RULE_CHUNKS` are populated as of 2026-09-14/15 --
   fifteen real citations total, five per jurisdiction (`JP`, `US`, `EU`), one per detector family,
   all approved via `SP_APPROVE_OBLIGATION`'s real `INFORMATION_SCHEMA` validation
@@ -320,7 +373,9 @@ returning `('JP', 1424)`. The query above now joins correctly with no jurisdicti
   T+1-business-day precedent for the pattern VIGIL implements), not a located citation of Japan's
   own transaction-report deadline rule specifically -- see that obligation's
   `OBLIGATION_DESCRIPTION` for the precise scope of the claim.
-- `DOCUMENTED_FINDINGS_LOG` isn't askable in natural language yet (section 2) -- SQL/CLI only.
+- ~~`DOCUMENTED_FINDINGS_LOG` isn't askable in natural language yet~~ -- FIXED 2026-09-15: it's
+  now the `DFL` table inside `SV_OBLIGATIONS_REPORTING`, reachable via the existing
+  `obligations_reporting` tool (section 1).
 - Best-execution questions are honest but currently uninteresting: 0 of 901 trades have a
   reference price to check against, since `TRADE_REFERENCE_PRICES` isn't populated by the
   synthetic generator.
