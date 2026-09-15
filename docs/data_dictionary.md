@@ -88,6 +88,7 @@ Live content: `JP` (FSA/SESC, ja), `US` (SEC/FINRA/CFTC, en), `EU` (ESMA, en) --
 | JURISDICTION_ID | TEXT | NO | A participant registers per jurisdiction; may belong to multiple venues within it. |
 | PARTICIPANT_TYPE | TEXT | YES | `broker` / `proprietary` / `institutional` / `retail`. |
 | BENEFICIAL_OWNER_ID | TEXT | YES | Logical FK -> BENEFICIAL_OWNERS. Nullable when genuinely unknown -- deliberately **not** self-referencing `PARTICIPANT_ID`, so the account and the beneficial owner are always two distinct identifier spaces (this is what lets wash-trading detection catch the same owner trading through different accounts). |
+| LEI | TEXT(20) | YES | ISO 17442 Legal Entity Identifier (added 2026-09-15, gap-8 OTC-derivatives MVP). Nullable -- only participants party to an OTC derivative trade need one; a synthetic dataset's value here is a synthetic-but-correctly-shaped code, never a real registered LOU identifier. |
 
 ---
 
@@ -153,8 +154,36 @@ Live content: `JP` (FSA/SESC, ja), `US` (SEC/FINRA/CFTC, en), `EU` (ESMA, en) --
 | Column | Type | Null? | Notes |
 |---|---|---|---|
 | PARTICIPANT_ID / INSTRUMENT_ID / JURISDICTION_ID / AS_OF_DATE | — | NO | |
-| NET_QUANTITY | NUMBER | YES | Cumulative signed sum of `TRADES.VOLUME` through `AS_OF_DATE`, roll-forward from the prior snapshot -- **never** derived from `ORDERS` (an order can be cancelled/rejected; only a trade changes a position). |
+| NET_QUANTITY | NUMBER | YES | Cumulative signed sum of `TRADES.VOLUME` through `AS_OF_DATE`, roll-forward from the prior snapshot -- **never** derived from `ORDERS` (an order can be cancelled/rejected; only a trade changes a position). Excludes OTC derivative trades (`VENUE_ID` on a `derivatives_only` venue) -- a swap's real "position" is a mark-to-market value, not a share-count `NET_QUANTITY`; out of scope until a valuation model exists. |
 | MARKET_VALUE / CURRENCY | — | — | |
+
+### DERIVATIVE_PRODUCT_ATTRIBUTES -- OTC derivative product identification (added 2026-09-15, gap-8 MVP)
+*PK: (INSTRUMENT_ID, JURISDICTION_ID, LOADED_AT)*
+
+One row per derivative instrument (`INSTRUMENTS.INSTRUMENT_TYPE = 'derivative'`), logical FK to INSTRUMENTS.
+
+| Column | Type | Null? | Notes |
+|---|---|---|---|
+| UPI | TEXT | YES | Unique Product Identifier -- DSB-format-shaped but synthetic, not a real DSB-registered code. |
+| ASSET_CLASS | TEXT | NO | CDE asset class, e.g. `Interest Rate`. |
+| CONTRACT_TYPE | TEXT | NO | e.g. `Swap`. |
+| UNDERLYING_ID_TYPE / UNDERLYING_ID | TEXT | YES | e.g. `Reference rate name` / `TONA` (Japan's real, BOJ-administered risk-free rate). |
+| DELIVERY_TYPE | TEXT | YES | `Cash` / `Physical`. |
+
+### DERIVATIVE_TRADE_DETAILS -- OTC derivative trade economics (added 2026-09-15, gap-8 MVP)
+*PK: (TRADE_ID, VENUE_ID, LOADED_AT)*. Real FK -> TRADES (TRADE_ID, VENUE_ID).
+
+| Column | Type | Null? | Notes |
+|---|---|---|---|
+| UTI | TEXT | NO | Unique Transaction Identifier, CPMI-IOSCO shape (generating entity's LEI + a unique code) -- synthetic, same discipline as `MARKET_PARTICIPANTS.LEI`. |
+| EFFECTIVE_DATE / MATURITY_DATE | DATE | NO | |
+| NOTIONAL_AMOUNT | NUMBER(20,2) | NO | Explicit precision -- see the platform-wide `NUMBER(38,0)`-truncation gap noted in architecture.md; this column and FIXED_RATE were deliberately given real precision rather than repeating it. |
+| NOTIONAL_CURRENCY | TEXT(8) | NO | No default -- market-agnostic rule #1. |
+| FIXED_RATE | NUMBER(9,6) | YES | Nullable -- not every product shape has a fixed leg. |
+| DAY_COUNT_CONVENTION | TEXT | YES | e.g. `ACT/365F`. |
+| PAYMENT_FREQUENCY_PERIOD / _MULTIPLIER | TEXT / NUMBER | YES | ISO 20022-style period code, e.g. `YEAR` / `1`. |
+| REPORTING_PARTY_DIRECTION | TEXT | NO | `payer` / `receiver`, of the fixed leg, from the reporting counterparty's side. |
+| COUNTERPARTY_2_ID_TYPE | TEXT | NO | Identifier-type tag for the counterparty side -- `LEI` is the only scheme this schema supports today. |
 
 ---
 
@@ -178,28 +207,66 @@ Live content: `JP` (FSA/SESC, ja), `US` (SEC/FINRA/CFTC, en), `EU` (ESMA, en) --
 | DEFERRED_PUBLICATION_UNTIL | TIMESTAMP_NTZ | YES | A permitted delayed public-disclosure window for a large-in-scale block trade -- a different clock from `DEADLINE` (submission vs. public disclosure). |
 | FIELDS_COMPLETE | BOOLEAN | YES | Computed against `REPORT_TEMPLATES_CURRENT WHERE IS_REQUIRED AND STATUS='mapped'` -- never measured against a gap field it could never satisfy. |
 | MATCH_STATUS | TEXT | YES | `full_match` / `partial_match` / `no_match` against the underlying trade's instrument (exact), price (exact), volume (exact), execution timestamp (documented tolerance). NULL when not a trade report. |
-| REPORT_PAYLOAD_REF | TEXT | YES | Pointer to the generated submission artifact; nullable until generated. |
+| REPORT_PAYLOAD_REF | TEXT | YES | Pointer to the generated submission artifact (a stage path); nullable until generated. Populated for real by `SP_RENDER_REPORT_PAYLOAD` (section 5) -- e.g. `@VIGIL.CORE.REPORT_PAYLOADS/JP/R0000110.csv`, a real downloadable CSV rendered from `REPORT_TEMPLATES_CURRENT`'s mapped fields, not a placeholder. |
 
 ### REPORT_TEMPLATES -- the regulator's own required field list
 *PK: (JURISDICTION_ID, REPORT_TYPE, FIELD_NAME, LOADED_AT)*
 
 | Column | Type | Null? | Notes |
 |---|---|---|---|
-| JURISDICTION_ID / REPORT_TYPE / FIELD_NAME | TEXT | NO | `FIELD_NAME` is the regulator's own field/tag name (e.g. `Trading_Capacity`) -- not a `VIGIL.CORE` column name. |
+| JURISDICTION_ID / REPORT_TYPE / FIELD_NAME | TEXT | NO | `FIELD_NAME` is the regulator's own field/tag name (e.g. `Trading capacity`) -- not a `VIGIL.CORE` column name. |
 | FIELD_ORDER | NUMBER | YES | Position for order-sensitive formats; NULL for tag-based (XML/JSON). |
 | STATUS | TEXT | NO | `proposed` (found by gap analysis) / `mapped` (`SOURCE_MAPPING` resolves) / `gap` (a required field with no current data source -- deliberate, non-blocking, surfaced not hidden). |
 | SOURCE_MAPPING | TEXT | YES | Free text (e.g. `TRADES.PRICE`) -- unenforceable as a real FK against a dynamic column reference; validated against `INFORMATION_SCHEMA` before `STATUS` can become `mapped`. |
 | FIELD_FORMAT | TEXT | YES | e.g. `ISO8601`, `ISIN`, `decimal(18,4)`. |
 | IS_REQUIRED | BOOLEAN | NO | Drives `TRANSACTION_REPORTS.FIELDS_COMPLETE` and `REPORT_TEMPLATE_COVERAGE`. |
 
-Live content (JP, `transaction_report`): `Instrument_ID`, `Price`, `Volume` (mapped), `Trading_Capacity` (gap -- no current data source; see the `data_dictionary` comparison discussion in NOTES.md on why this couldn't yet be traced to a specific rule citation).
+Live content:
+- **JP, `transaction_report`** (5 fields, all `mapped`): `Instrument_ID`, `Price`, `Volume`,
+  `Trading_Capacity`, `Report_Status`. Field names are generator-internal style, not a regulator's
+  own terminology -- this equity-shaped report type still has no field-level citation of its own
+  (the underlying rule for *this specific* report is unsourced; see `otc_derivative_transaction_report`
+  below for the citation that does exist, for a different product scope).
+- **JP, `otc_derivative_transaction_report`** (138 fields, real field names, 23 `mapped` / 115
+  `gap`, `IS_REQUIRED=TRUE` throughout): sourced from the FSA's own "Guidelines for Creating,
+  Recordkeeping and Reporting of Transaction Information" (Cabinet Office Order No. 48 of 2012,
+  Art. 4(1); FIEA Art. 156-63~65) -- `docs/sources/JP_FSA_OTC_derivatives_reporting_guideline.pdf`,
+  extracted+verified via `pdftotext`. A real, numbered 138-element field list Japan adopted from
+  the internationally harmonized CDE (Critical Data Elements) OTC-derivatives standard (the same
+  one behind EMIR/Dodd-Frank). Originally only 3 fields mapped (`Execution timestamp`, `Price`,
+  `Price currency`, all off `TRADES`); a scoped MVP pass (2026-09-15) built a real interest-rate
+  swap model -- `MARKET_PARTICIPANTS.LEI`, `DERIVATIVE_PRODUCT_ATTRIBUTES`,
+  `DERIVATIVE_TRADE_DETAILS` (see section 2 above) -- and re-mapped `Price`/`Price currency` to
+  `DERIVATIVE_TRADE_DETAILS.FIXED_RATE`/`NOTIONAL_CURRENCY` (a platform-wide `NUMBER(38,0)`
+  precision gap meant `TRADES.PRICE` silently truncated a fixed rate like 0.0075 to 0 --
+  architecture.md). 20 more fields mapped: effective/expiration dates, both counterparties' LEI,
+  counterparty-2 identifier type, direction, UTI, day count/payment frequency, notional
+  amount/currency, and product identification (UPI, asset class, contract type, underlying).
+  Still gap: margin/collateral/valuation (fields 39-63) and every option/CDS/package-specific
+  field -- a real mark-to-market/collateral-posting model, explicitly out of scope for this pass,
+  not silently dropped. Seeded as a separate `REPORT_TYPE` from JP's `transaction_report`
+  (equity-shaped) rather than folded in -- this document governs OTC derivatives specifically, a
+  different product scope, and conflating them would misattribute the citation.
+- **EU, `transaction_report`** (65 fields, real RTS 22 Annex I Table 2 field names, 7 `mapped` /
+  58 `gap`, `IS_REQUIRED=TRUE` throughout): sourced from Commission Delegated Regulation (EU)
+  2017/590 (`docs/sources/EU_RTS22_2017_590.pdf`), extracted+verified via `pdftotext`, not
+  paraphrased. Mapped: `Trading date time`->`EXECUTION_TIMESTAMP`, `Trading capacity`->
+  `REGULATORY_ATTRIBUTES:Trading_Capacity`, `Quantity`->`VOLUME`, `Price`->`PRICE`, `Price
+  currency`->`CURRENCY`, `Venue`->`VENUE_ID`, `Instrument identification code`->`INSTRUMENT_ID`.
+  Gap: every buyer/seller LEI/natural-person/decision-maker field, every derivative/option/swap
+  field (no derivatives model exists), waiver/short-sale/OTC/commodity-derivative/SFT indicators.
+  Seeded under `EU`, not `JP` -- RTS 22 is the EU's own standard; mixing it into JP's template
+  would misattribute a European rule to Japan's format (market-agnostic design rule).
 
 ### REPORT_TEMPLATE_RULE_CHUNKS
 *PK: (JURISDICTION_ID, REPORT_TYPE, FIELD_NAME, RULE_CHUNK_ID, LOADED_AT)*
 
 Mirrors `OBLIGATION_RULE_CHUNKS` (section 4) exactly -- links a required report field to the
-`RULE_CORPUS` chunk that requires it, with the same `IS_ACTIVE` tombstone pattern. **Currently
-empty for all three jurisdictions** -- see section 9.
+`RULE_CORPUS` chunk that requires it, with the same `IS_ACTIVE` tombstone pattern. 65 real links
+for EU `transaction_report` (citing `EU-RTS22-ANNEXI-TABLE2`) and 138 for JP
+`otc_derivative_transaction_report` (citing `JP-FSA-OTC-DERIV-ART4-1`); still empty for JP's own
+`transaction_report` and for US -- no citation-verified field-level source has been found for
+either of those specific report types yet.
 
 ### REPORT_TEMPLATE_COVERAGE *(view)*
 One row per `(JURISDICTION_ID, REPORT_TYPE)`: `REQUIRED_FIELD_COUNT`, `MAPPED_REQUIRED_FIELD_COUNT`,
@@ -386,13 +453,24 @@ Source PDFs: `docs/sources/`. Full sourcing detail and honesty caveats (e.g. `JP
 OSE's *position-report* deadline, not a located citation of Japan's own transaction-report
 deadline): NOTES.md, `sql/governance/01_*.sql` (JP) and `02_*.sql` (US/EU).
 
-US/EU have **no trade data at all** -- no `JURISDICTION_CONFIG`, venues, participants, orders, or
-trades. The obligations above are real and approved; querying any detector view or `TRADES`
-directly `WHERE JURISDICTION_ID IN ('US','EU')` honestly returns 0 rows.
+**US/EU now have real trade data** (2026-09-15) -- `US_CONFIG`/`EU_CONFIG` in
+`generator/jurisdiction_config.py`, live-verified venue lists (SEC's own current exchange
+registry for US; Deutsche Börse Group's real venues for EU, since "EU" isn't one exchange),
+loaded via `scripts/load_us_eu_configs.py`. Every detector view now returns real, non-trivial
+findings for both jurisdictions (see NOTES.md 2026-09-15 for exact figures — wash trading,
+spoofing, position limits, reporting timeliness, and best-execution slippage all produce real
+non-zero numbers for both). The 10 US/EU obligation descriptions above were re-approved the same
+day to replace their now-stale "currently unexercised" language with the real finding counts.
 
-`REPORT_TEMPLATE_RULE_CHUNKS` is empty for all three jurisdictions -- no jurisdiction's
-field-level report-format citation (e.g. Japan's `Trading_Capacity`) was traced to a specific
-source with enough precision to cite honestly.
+`REPORT_TEMPLATE_RULE_CHUNKS` has 65 real citation links for **EU** `transaction_report` (all
+Annex I Table 2 fields, citing `EU-RTS22-ANNEXI-TABLE2` -- Commission Delegated Regulation (EU)
+2017/590) and 138 for **JP** `otc_derivative_transaction_report` (citing
+`JP-FSA-OTC-DERIV-ART4-1` -- the FSA's own OTC-derivatives-reporting guideline, Cabinet Office
+Order No. 48 of 2012 Art. 4(1); found on a fourth sourcing pass after three real, thorough
+searches scoped to *equity* transaction reporting had all correctly found nothing — this document
+covers a different regulatory track, OTC derivatives specifically). Still empty for JP's own
+`transaction_report` (equity-shaped) and for US -- no field-level citation has been traced for
+either of those two specific report types yet.
 
 ---
 
@@ -414,11 +492,21 @@ SOURCE_AUTHORITY, ORIGINAL_LANGUAGE`. Granted to `ANALYST_READ`.
 
 | Role | Can write | Can read |
 |---|---|---|
-| `MARKET_DATA_INGEST` | Reference data + ORDERS/TRADES/TRADE_CORRECTIONS/TRANSACTION_REPORTS/POSITIONS/TRADE_REFERENCE_PRICES/JURISDICTIONS (INSERT only) | REPORT_TEMPLATES_CURRENT |
-| `GOVERNANCE_WRITE` | OBLIGATION_MAP, OBLIGATION_RULE_CHUNKS, RULE_CORPUS, REPORT_TEMPLATES, REPORT_TEMPLATE_RULE_CHUNKS (INSERT only) | OBLIGATION_MAP (base table, to see `proposed` rows) |
+| `MARKET_DATA_INGEST` | Reference data + ORDERS/TRADES/TRADE_CORRECTIONS/TRANSACTION_REPORTS/POSITIONS/TRADE_REFERENCE_PRICES/JURISDICTIONS (INSERT only); can `CALL SP_RENDER_REPORT_PAYLOAD` | REPORT_TEMPLATES_CURRENT |
+| `GOVERNANCE_WRITE` | OBLIGATION_MAP, OBLIGATION_RULE_CHUNKS, RULE_CORPUS, REPORT_TEMPLATES, REPORT_TEMPLATE_RULE_CHUNKS (INSERT only) | OBLIGATION_MAP, REPORT_TEMPLATES, REPORT_TEMPLATE_RULE_CHUNKS base tables + `_CURRENT` views (Fix #30 -- SELECT on the latter two added alongside this doc; previously INSERT-only with no way to read its own rows back) |
 | `AUDIT_INSERT` | AUDIT_LOG (INSERT only, no direct grant elsewhere -- all writes go through `EXECUTE AS OWNER` procedures) | — |
-| `ANALYST_READ` | **nothing** -- no write access anywhere | Everything in sections 1-8 above, `RULE_CORPUS_SEARCH`, `VIGIL_SURVEILLANCE_AGENT` |
+| `ANALYST_READ` | **nothing** -- no write access anywhere | Everything in sections 1-8 above, `RULE_CORPUS_SEARCH`, `VIGIL_SURVEILLANCE_AGENT`, `READ` on `REPORT_PAYLOADS` stage |
 | `OFFICER_SIGNOFF` | Sign-off rows via `SP_RECORD_SIGNOFF` (`EXECUTE AS OWNER`) | — |
 
 No functional role ever holds `UPDATE`/`DELETE` on anything in `VIGIL.CORE` -- a property of the
 grant scripts themselves (`sql/rbac/`), not of who happens to be running them.
+
+### Report-payload rendering: `SP_RENDER_REPORT_PAYLOAD` (`sql/procedures/sp_render_report_payload.sql`)
+`SP_RENDER_REPORT_PAYLOAD(P_REPORT_ID, P_JURISDICTION_ID)` -- `EXECUTE AS OWNER` (same elevation
+pattern as `SP_RECORD_SIGNOFF`, since `MARKET_DATA_INGEST` has no `SELECT` on `TRADES`). Renders a
+real CSV to the `REPORT_PAYLOADS` internal stage from `REPORT_TEMPLATES_CURRENT`'s currently-
+`mapped` fields for a trade-scoped report, re-validating every `SOURCE_MAPPING` against live
+`INFORMATION_SCHEMA` before building dynamic SQL from it, and refuses to render if any mapped
+field isn't `TRADES`-sourced (never a partial/misleading payload). Writes the real
+`REPORT_PAYLOAD_REF` back as a new milestoned `TRANSACTION_REPORTS` row. Not the regulator's
+actual XML/fixed-width submission format -- narrower and real, not a full adaptor.

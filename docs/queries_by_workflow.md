@@ -365,10 +365,12 @@ returning `('JP', 1424)`. The query above now joins correctly with no jurisdicti
   source URLs and the original PDFs saved in `docs/sources/`). US/EU are governance content only
   -- no `JURISDICTION_CONFIG`, venues, or synthetic trade data exist for either, so the detector
   views honestly return 0 rows `WHERE JURISDICTION_ID IN ('US','EU')`; the obligations are real
-  and approved, just currently unexercised. `REPORT_TEMPLATE_RULE_CHUNKS` is still empty for all
-  three jurisdictions -- citing which exact ordinance/form clause requires a specific report field
-  (e.g. Japan's `Trading_Capacity` gap field) needs each regulator's prescribed form spec, which
-  this pass didn't find precise citations for; left open rather than forcing inexact ones. Note
+  and approved, just currently unexercised. `REPORT_TEMPLATE_RULE_CHUNKS` now has 65 real
+  field-level citations for **EU** `transaction_report` (RTS 22 Annex I Table 2,
+  `sql/governance/03_eu_report_template_rts22_seed.sql`, 2026-09-15) -- still empty for **JP**:
+  citing which exact ordinance/form clause requires a specific JP report field needs Japan's own
+  prescribed form spec, which two research passes haven't found precise citations for; left open
+  rather than forcing inexact ones. Note
   also that `JP-RPTTIME-001`'s citation is OSE's *large position report* deadline (a real
   T+1-business-day precedent for the pattern VIGIL implements), not a located citation of Japan's
   own transaction-report deadline rule specifically -- see that obligation's
@@ -376,9 +378,10 @@ returning `('JP', 1424)`. The query above now joins correctly with no jurisdicti
 - ~~`DOCUMENTED_FINDINGS_LOG` isn't askable in natural language yet~~ -- FIXED 2026-09-15: it's
   now the `DFL` table inside `SV_OBLIGATIONS_REPORTING`, reachable via the existing
   `obligations_reporting` tool (section 1).
-- Best-execution questions are honest but currently uninteresting: 0 of 901 trades have a
-  reference price to check against, since `TRADE_REFERENCE_PRICES` isn't populated by the
-  synthetic generator.
+- Best-execution: `TRADE_REFERENCE_PRICES` is populated (773 of 901 JP trades have a reference
+  price; one venue deliberately excluded to keep that coverage gap real) -- being reworked
+  2026-09-15 from a trade-price-plus-noise formula (mathematically near-zero by construction) to
+  a same-day VWAP of other trades in the instrument (a genuinely independent signal) -- see NOTES.md.
 - There is no automated pipeline for sourcing regulatory text -- everything in `RULE_CORPUS` was a
   one-time manual pass (web search -> download PDF -> `pdftotext` -> hand-pick the citable excerpt
   -> hand-write into a seed SQL file). Snowflake has native building blocks that could automate
