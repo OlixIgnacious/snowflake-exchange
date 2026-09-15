@@ -1,12 +1,13 @@
 -- GOVERNANCE_WRITE: INSERT-only on OBLIGATION_MAP/OBLIGATION_RULE_CHUNKS (Fix #12 -- the
 -- proposed->approved flip is a new row, never an UPDATE), INSERT on RULE_CORPUS, plus SELECT on
 -- the base OBLIGATION_MAP table (to see proposed rows ANALYST_READ cannot, via APPROVED_
--- OBLIGATIONS only). Also INSERT-only on REPORT_TEMPLATES/REPORT_TEMPLATE_RULE_CHUNKS (Fix #21
--- -- a report template is regulatory content, same category as RULE_CORPUS/OBLIGATION_MAP, not
--- raw market data routed through MARKET_DATA_INGEST).
+-- OBLIGATIONS only). Also INSERT+SELECT on REPORT_TEMPLATES/REPORT_TEMPLATE_RULE_CHUNKS (Fix #21;
+-- SELECT added Fix #30 -- a report template is regulatory content, same category as
+-- RULE_CORPUS/OBLIGATION_MAP, and this role needs to read back its own proposed/gap rows the same
+-- way it already can for OBLIGATION_MAP, not write blind).
 --
 -- Never UPDATE/DELETE on anything (milestoning discipline rule 3) -- this file issues INSERT and
--- one SELECT grant only.
+-- SELECT grants only.
 
 USE ROLE ACCOUNTADMIN;
 USE DATABASE VIGIL;
@@ -17,4 +18,11 @@ GRANT SELECT ON TABLE OBLIGATION_MAP TO ROLE GOVERNANCE_WRITE;
 GRANT INSERT ON TABLE OBLIGATION_RULE_CHUNKS TO ROLE GOVERNANCE_WRITE;
 GRANT INSERT ON TABLE RULE_CORPUS TO ROLE GOVERNANCE_WRITE;
 GRANT INSERT ON TABLE REPORT_TEMPLATES TO ROLE GOVERNANCE_WRITE;
+GRANT SELECT ON TABLE REPORT_TEMPLATES TO ROLE GOVERNANCE_WRITE;
 GRANT INSERT ON TABLE REPORT_TEMPLATE_RULE_CHUNKS TO ROLE GOVERNANCE_WRITE;
+GRANT SELECT ON TABLE REPORT_TEMPLATE_RULE_CHUNKS TO ROLE GOVERNANCE_WRITE;
+-- SELECT on the _CURRENT views too (Fix #30 -- review-flagged RBAC asymmetry: this role could
+-- write REPORT_TEMPLATES/REPORT_TEMPLATE_RULE_CHUNKS rows but never read its own current state
+-- back, the same review-worthy gap that never existed for OBLIGATION_MAP's SELECT grant above).
+GRANT SELECT ON VIEW REPORT_TEMPLATES_CURRENT TO ROLE GOVERNANCE_WRITE;
+GRANT SELECT ON VIEW REPORT_TEMPLATE_RULE_CHUNKS_CURRENT TO ROLE GOVERNANCE_WRITE;

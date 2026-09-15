@@ -50,9 +50,17 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
 
     tables: dict[str, list[dict]] = {t: [] for t in [
         "JURISDICTIONS", "VENUES", "BENEFICIAL_OWNERS", "INSTRUMENTS", "MARKET_PARTICIPANTS",
-        "ORDERS", "TRADES", "POSITIONS", "TRANSACTION_REPORTS",
-        "DETECTOR_CALIBRATION", "REPORT_TEMPLATES",
+        "ORDERS", "TRADES", "TRADE_REFERENCE_PRICES", "POSITIONS", "TRANSACTION_REPORTS",
+        "DETECTOR_CALIBRATION", "REPORT_TEMPLATES", "CORPORATE_ACTIONS",
+        "DERIVATIVE_PRODUCT_ATTRIBUTES", "DERIVATIVE_TRADE_DETAILS",
     ]}
+
+    # Venues that exist only so an OTC derivative trade has somewhere real to point VENUE_ID at
+    # (e.g. DDRJ, a trade repository) -- excluded from every equity order/trade/detector-
+    # calibration code path below, which all assume an exchange/pts/OTC-facility a cash instrument
+    # actually trades on.
+    equity_eligible_venues = [v for v in cfg.venues if not v.derivatives_only]
+    derivative_venue_ids = {v.venue_id for v in cfg.venues if v.derivatives_only}
 
     def audit_cols(created_at, created_by, loaded_at=None, loaded_by=None):
         return {
@@ -94,14 +102,16 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
         })
 
     # MARKET_PARTICIPANTS -- some share a beneficial owner deliberately, for wash-trading cases
-    n_participants = cfg.participants_per_venue * max(len([v for v in cfg.venues if v.status == "active"]), 1)
+    n_participants = cfg.participants_per_venue * max(len([v for v in equity_eligible_venues if v.status == "active"]), 1)
     participant_ids = [f"P{i:03d}" for i in range(n_participants)]
     for i, pid in enumerate(participant_ids):
         boid = owner_ids[i % len(owner_ids)] if rng.random() < 0.6 else None
         tables["MARKET_PARTICIPANTS"].append({
             "PARTICIPANT_ID": pid, "JURISDICTION_ID": cfg.jurisdiction_id,
             "PARTICIPANT_TYPE": rng.choice(["broker", "proprietary", "institutional", "retail"]),
-            "BENEFICIAL_OWNER_ID": boid, **audit_cols(now, "generator"),
+            "BENEFICIAL_OWNER_ID": boid,
+            "LEI": None,  # populated below, only for participants in an OTC derivative trade
+            **audit_cols(now, "generator"),
         })
 
     # Deliberate wash-trading pair: two participants sharing the same beneficial owner
@@ -114,7 +124,7 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
         wash_participants = [tables["MARKET_PARTICIPANTS"][0]["PARTICIPANT_ID"], tables["MARKET_PARTICIPANTS"][1]["PARTICIPANT_ID"]]
 
     # Deliberate spoofing participant/instrument/venue
-    active_venues = [v for v in cfg.venues if v.status == "active"]
+    active_venues = [v for v in equity_eligible_venues if v.status == "active"]
     spoof_participant = participant_ids[2 % len(participant_ids)]
     spoof_instrument = instrument_ids[0]
     spoof_venue = active_venues[0].venue_id
@@ -134,7 +144,7 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
 
     # --- Baseline random orders + trades, respecting each venue's active window ---
     for _ in range(n_orders):
-        venue = rng.choice(cfg.venues)
+        venue = rng.choice(equity_eligible_venues)
         start, end = _venue_window(venue, cfg)
         if start > end:
             continue
@@ -275,9 +285,174 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
                 **audit_cols(ts2, "generator"),
             })
 
-    # --- POSITIONS: accumulate NET_QUANTITY from TRADES only (Fix #4) ---
+    # --- REGULATORY_ATTRIBUTES.Trading_Capacity: closes the real gap in REPORT_TEMPLATES (was
+    # STATUS='gap', no source) -- TRADES.REGULATORY_ATTRIBUTES VARIANT was added for exactly this
+    # (Fix #26, "LEI, trading capacity, short-sell flag, etc.") but the generator never actually
+    # populated it, so the field mapping stayed a documented gap instead of a real one closing.
+    # Codes are the standard MiFID RTS 22 trading-capacity vocabulary (DEAL/MTCH/AOTC) -- real,
+    # recognized regulatory codes, used here because no JP-specific citation for this exact field's
+    # code vocabulary has been sourced yet (architecture.md's own open item, still true after this
+    # fix: the *field* is now genuinely populated and mapped, not the *citation* for its code set).
+    for t in tables["TRADES"]:
+        t["REGULATORY_ATTRIBUTES"] = {"Trading_Capacity": rng.choice(["DEAL", "MTCH", "AOTC"])}
+
+    # --- TRADE_REFERENCE_PRICES: synthetic NBBO-equivalent, so best-execution slippage has real
+    # demo numbers instead of sitting empty (architecture.md notes this table is normally
+    # populated by its own external adaptor, out of scope for this generator -- these rows are
+    # clearly labeled SOURCE='synthetic_nbbo_equivalent', not a stand-in for a real feed).
+    # architecture.md/03_trades.sql are explicit that reference-price coverage is genuinely
+    # venue-dependent (some venues never publish an NBBO-equivalent) -- one active venue is
+    # deliberately left with no TRADE_REFERENCE_PRICES rows at all so that gap stays real and
+    # visible here too, not silently filled in along with everything else.
+    #
+    # Review finding fixed here: the reference price used to be `trade.PRICE * (1 +/- noise)` --
+    # mathematically guaranteed to sit near zero slippage by construction, since the "benchmark"
+    # was derived from the trade's own price. Replaced with a volume-weighted average price
+    # (VWAP) of every OTHER trade in the same (INSTRUMENT_ID, VENUE_ID) -- a real, standard TCA
+    # benchmark methodology, and one that no longer depends on the specific trade's own price at
+    # all. Grouped across the whole simulation period, not per calendar day: this dataset trades
+    # thinly (median 1 trade per instrument/venue/day; verified live -- 865 distinct
+    # instrument/venue/day groups, only 35 have more than one trade), so a same-day-only window
+    # would leave the overwhelming majority of trades with no reference price at all -- an honest
+    # gap, but a needlessly large one for a synthetic universe where a same-instrument historical
+    # average is just as legitimate a benchmark. REFERENCE_PRICE_AT_EXECUTION is the full-history
+    # VWAP of every other trade in that instrument/venue (every instrument/venue combination has
+    # at least 2 trades, verified live, so this covers effectively every trade).
+    # REFERENCE_PRICE_AT_ARRIVAL uses only the other trades at-or-before the order's own 'new'
+    # event timestamp (no lookahead -- an arrival benchmark can only use information that existed
+    # when the order arrived), so it naturally has lower coverage than the execution benchmark --
+    # a trade with no prior trade in its instrument/venue gets no arrival reference price, a real
+    # coverage gap (nothing existed yet to benchmark against), not a fabricated one.
+    no_reference_price_venue = active_venues[-1].venue_id if len(active_venues) > 1 else None
+    order_new_event_ts: dict[tuple[str, str], datetime] = {
+        (o["ORDER_ID"], o["VENUE_ID"]): o["EVENT_TS"]
+        for o in tables["ORDERS"] if o["EVENT_TYPE"] == "new" and o["ORDER_ID"] is not None
+    }
+    trades_by_group: dict[tuple[str, str], list[dict]] = {}
+    for t in tables["TRADES"]:
+        if t["VENUE_ID"] == no_reference_price_venue:
+            continue
+        key = (t["INSTRUMENT_ID"], t["VENUE_ID"])
+        trades_by_group.setdefault(key, []).append(t)
+
+    for group in trades_by_group.values():
+        total_pv = sum(g["PRICE"] * g["VOLUME"] for g in group)
+        total_vol = sum(g["VOLUME"] for g in group)
+        for t in group:
+            other_vol = total_vol - t["VOLUME"]
+            if other_vol <= 0:
+                continue  # the only trade ever recorded in this instrument/venue -- nothing to benchmark against
+            ref_exec = round((total_pv - t["PRICE"] * t["VOLUME"]) / other_vol, 2)
+
+            ref_arrival = None
+            arrival_ts = order_new_event_ts.get((t["ORDER_ID"], t["VENUE_ID"]))
+            if arrival_ts is not None:
+                prior = [g for g in group if g["TRADE_ID"] != t["TRADE_ID"] and g["EXECUTION_TIMESTAMP"] <= arrival_ts]
+                prior_vol = sum(g["VOLUME"] for g in prior)
+                if prior_vol > 0:
+                    ref_arrival = round(sum(g["PRICE"] * g["VOLUME"] for g in prior) / prior_vol, 2)
+
+            tables["TRADE_REFERENCE_PRICES"].append({
+                "TRADE_ID": t["TRADE_ID"], "VENUE_ID": t["VENUE_ID"],
+                "REFERENCE_PRICE_AT_EXECUTION": ref_exec, "REFERENCE_PRICE_AT_ARRIVAL": ref_arrival,
+                "CURRENCY": t["CURRENCY"], "SOURCE": "synthetic_nbbo_equivalent",
+                **audit_cols(t["EXECUTION_TIMESTAMP"], "generator"),
+            })
+
+    # --- OTC derivatives (scoped MVP closing gap 8's field-citation fix): a real fixed-for-
+    # floating interest-rate swap product + two trades, so REPORT_TEMPLATES' 138-field
+    # otc_derivative_transaction_report has something real to map beyond the original 3 fields
+    # (Execution timestamp/Price/Price currency) -- LEI-based counterparty identification, UTI,
+    # and the swap's own economics (notional, fixed rate, day count, payment frequency,
+    # effective/maturity dates, asset class/product/underlying identification). Deliberately does
+    # NOT touch valuation/margin/collateral (fields 39-63, 44-63) -- those need a genuine
+    # mark-to-market/collateral-posting model this MVP pass doesn't build (explicit scope decision,
+    # not a silently dropped gap).
+    #
+    # Gated by cfg.generate_otc_derivatives (market-agnostic rule #7: config-driven, never a
+    # hardcoded jurisdiction check) -- only JAPAN_CONFIG sets this True, because JP is the only
+    # jurisdiction with a real regulatory citation for this report type today.
+    if cfg.generate_otc_derivatives:
+        otc_venue = next(v for v in cfg.venues if v.derivatives_only)
+        institutional = [p for p in tables["MARKET_PARTICIPANTS"] if p["PARTICIPANT_TYPE"] == "institutional"]
+
+        def synthetic_lei(seed_key: str) -> str:
+            # ISO 17442 shape (20 alphanumeric characters) -- a synthetic value, not a real
+            # registered LEI (minting one requires actual LOU registration, out of scope for a
+            # synthetic dataset). Deterministic per key so reruns are stable.
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            local_rng = random.Random(seed_key)
+            return "".join(local_rng.choice(alphabet) for _ in range(20))
+
+        reporting_participant, counterparty_b, counterparty_c = institutional[0], institutional[1], institutional[2]
+        for p in (reporting_participant, counterparty_b, counterparty_c):
+            p["LEI"] = synthetic_lei(p["PARTICIPANT_ID"] + cfg.jurisdiction_id)
+
+        deriv_instrument_id = "IDRV01"
+        tables["INSTRUMENTS"].append({
+            "INSTRUMENT_ID": deriv_instrument_id, "JURISDICTION_ID": cfg.jurisdiction_id, "ISIN": None,
+            "INSTRUMENT_TYPE": "derivative", "TICK_SIZE": None, "LOT_SIZE": None,
+            **audit_cols(now, "generator"),
+        })
+        tables["DERIVATIVE_PRODUCT_ATTRIBUTES"].append({
+            "INSTRUMENT_ID": deriv_instrument_id, "JURISDICTION_ID": cfg.jurisdiction_id,
+            # DSB-format-shaped (12 chars) but NOT a real registered UPI -- minting one requires
+            # actual DSB registration, same synthetic-but-realistic-format discipline as the LEIs.
+            "UPI": "SYNUPI000001", "ASSET_CLASS": "Interest Rate", "CONTRACT_TYPE": "Swap",
+            "UNDERLYING_ID_TYPE": "Reference rate name",
+            "UNDERLYING_ID": cfg.rfr_benchmark,
+            "DELIVERY_TYPE": "Cash",
+            **audit_cols(now, "generator"),
+        })
+
+        # Two trades, opposite fixed-rate direction, different tenors/counterparties -- deliberately
+        # NOT a mirrored A-B pair (would structurally resemble a wash-trading match on the same
+        # instrument, a false signal for what is really independent hedging activity).
+        swap_specs = [
+            (reporting_participant, counterparty_b, "payer", 5, 1_000_000_000, 0.0075),
+            (reporting_participant, counterparty_c, "receiver", 10, 500_000_000, 0.0120),
+        ]
+        for reporting_p, other_p, direction, tenor_years, notional, fixed_rate in swap_specs:
+            effective_date = cfg.sim_start + (cfg.sim_end - cfg.sim_start) // 3
+            maturity_date = date(effective_date.year + tenor_years, effective_date.month, effective_date.day)
+            exec_ts = datetime(effective_date.year, effective_date.month, effective_date.day, 10, 0, 0)
+            trade_id = new_trade_id()
+            tables["TRADES"].append({
+                "TRADE_ID": trade_id, "JURISDICTION_ID": cfg.jurisdiction_id, "VENUE_ID": otc_venue.venue_id,
+                "ORDER_ID": None, "INSTRUMENT_ID": deriv_instrument_id, "EXECUTION_TIMESTAMP": exec_ts,
+                # TRADES.PRICE is NUMBER(38,0) platform-wide (a real, separate, pre-existing gap:
+                # every price-like column here silently truncates decimals -- flagged, not fixed
+                # retroactively across the whole schema by this pass). A raw fixed rate like
+                # 0.0075 would truncate to 0, so this stores it in basis points (75) instead -- a
+                # real, non-fabricated, non-zero derived value -- while REPORT_TEMPLATES' field 64
+                # "Price" is mapped to DERIVATIVE_TRADE_DETAILS.FIXED_RATE (NUMBER(9,6), the
+                # correctly-precisioned real value) for this report type, not to this column.
+                "PRICE": round(fixed_rate * 10000), "CURRENCY": cfg.currency, "VOLUME": 1,
+                "PARTICIPANT_ID": reporting_p["PARTICIPANT_ID"],
+                "COUNTERPARTY_PARTICIPANT_ID": other_p["PARTICIPANT_ID"],
+                "MATCHING_MECHANISM": "otc_bilateral",
+                "REGULATORY_ATTRIBUTES": {"Trading_Capacity": "DEAL"},
+                **audit_cols(exec_ts, "generator"),
+            })
+            tables["DERIVATIVE_TRADE_DETAILS"].append({
+                "TRADE_ID": trade_id, "VENUE_ID": otc_venue.venue_id,
+                "UTI": f"{reporting_p['LEI']}T{trade_counter:08d}",
+                "EFFECTIVE_DATE": effective_date, "MATURITY_DATE": maturity_date,
+                "NOTIONAL_AMOUNT": notional, "NOTIONAL_CURRENCY": cfg.currency,
+                "FIXED_RATE": fixed_rate, "DAY_COUNT_CONVENTION": "ACT/365F",
+                "PAYMENT_FREQUENCY_PERIOD": "YEAR", "PAYMENT_FREQUENCY_MULTIPLIER": 1,
+                "REPORTING_PARTY_DIRECTION": direction, "COUNTERPARTY_2_ID_TYPE": "LEI",
+                **audit_cols(exec_ts, "generator"),
+            })
+
+    # --- POSITIONS: accumulate NET_QUANTITY from TRADES only (Fix #4). OTC derivative trades are
+    # excluded here -- a swap's real "position" is a mark-to-market value (VARIATION_MARGIN/
+    # valuation, REPORT_TEMPLATES fields 39-63), not a share-count-style NET_QUANTITY, and this
+    # MVP pass explicitly does not build a valuation model (see the OTC-derivatives block above).
     running: dict[tuple, float] = {}
     for t in sorted(tables["TRADES"], key=lambda r: r["EXECUTION_TIMESTAMP"]):
+        if t["VENUE_ID"] in derivative_venue_ids:
+            continue
         key = (t["PARTICIPANT_ID"], t["INSTRUMENT_ID"], t["JURISDICTION_ID"])
         signed = t["VOLUME"]  # simplification: treat participant side as always a buy accumulation
         running[key] = running.get(key, 0) + signed
@@ -290,14 +465,30 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
             "CREATED_AT": loaded_at, "CREATED_BY": "generator",
         })
 
+    # --- CORPORATE_ACTIONS: one real, deterministic split so POSITIONS_ADJUSTED (09_corporate_
+    # actions.sql) has a genuine, non-trivial case to verify continuity against instead of an
+    # empty table -- closes the review finding that corporate-actions handling was flagged as
+    # deferred (Fix #4) but never actually built. Targets the last instrument in the config
+    # (index cfg.instrument_count - 1, e.g. "I07" for Japan's 8-instrument universe) -- always
+    # exists regardless of seed, and mid-simulation-window so both pre- and post-split POSITIONS
+    # snapshots exist to adjust/leave-alone respectively.
+    split_instrument_id = f"I{cfg.instrument_count - 1:02d}"
+    split_effective_date = cfg.sim_start + (cfg.sim_end - cfg.sim_start) // 2
+    tables["CORPORATE_ACTIONS"].append({
+        "JURISDICTION_ID": cfg.jurisdiction_id, "INSTRUMENT_ID": split_instrument_id,
+        "ACTION_TYPE": "split", "RATIO": 2.0, "EFFECTIVE_DATE": split_effective_date,
+        **audit_cols(now, "generator"),
+    })
+
     # --- TRANSACTION_REPORTS: one per trade, some deliberately late ---
     for i, t in enumerate(tables["TRADES"]):
         deadline = _next_business_day_deadline(t["EXECUTION_TIMESTAMP"])
         late = (i % 11 == 0)
         submitted = deadline + timedelta(hours=6) if late else t["EXECUTION_TIMESTAMP"] + timedelta(hours=2)
+        report_type = "otc_derivative_transaction_report" if t["VENUE_ID"] in derivative_venue_ids else "transaction_report"
         tables["TRANSACTION_REPORTS"].append({
             "REPORT_ID": f"R{i:07d}", "JURISDICTION_ID": cfg.jurisdiction_id, "VENUE_ID": t["VENUE_ID"],
-            "REPORT_TYPE": "transaction_report", "REPORT_SCOPE": "trade", "TRADE_ID": t["TRADE_ID"],
+            "REPORT_TYPE": report_type, "REPORT_SCOPE": "trade", "TRADE_ID": t["TRADE_ID"],
             "PERIOD_START": None, "PERIOD_END": None, "REPORT_STATUS": "new",
             "SUBMITTED_AT": submitted, "DEADLINE": deadline, "DEFERRED_PUBLICATION_UNTIL": None,
             "FIELDS_COMPLETE": (i % 13 != 0), "MATCH_STATUS": "full_match",
@@ -309,7 +500,7 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
     # need to be surveillable (architecture.md's whole rationale for date-bounding rather than
     # excluding a discontinued venue). Calibration scope is "can this venue's trades be
     # analyzed," not "is this venue still open."
-    for v in cfg.venues:
+    for v in equity_eligible_venues:
         tables["DETECTOR_CALIBRATION"].append({
             "JURISDICTION_ID": cfg.jurisdiction_id, "VENUE_ID": v.venue_id, "DETECTOR_NAME": "wash_trading",
             "DIMENSION_KEY": None, "Z_THRESHOLD": None, "MIN_BASELINE_PERIODS": None,
@@ -338,7 +529,7 @@ def generate(cfg: JurisdictionConfig, seed: int = 42, n_orders: int = 1500) -> d
         ("Price", "TRADES.PRICE", True, "mapped"),
         ("Volume", "TRADES.VOLUME", True, "mapped"),
         ("Instrument_ID", "TRADES.INSTRUMENT_ID", True, "mapped"),
-        ("Trading_Capacity", None, True, "gap"),
+        ("Trading_Capacity", "TRADES.REGULATORY_ATTRIBUTES:Trading_Capacity", True, "mapped"),
     ]:
         tables["REPORT_TEMPLATES"].append({
             "JURISDICTION_ID": cfg.jurisdiction_id, "REPORT_TYPE": "transaction_report", "FIELD_NAME": field_name,

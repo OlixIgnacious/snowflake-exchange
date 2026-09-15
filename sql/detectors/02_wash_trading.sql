@@ -52,7 +52,15 @@ SELF_TRADE AS (
       AND p1.BENEFICIAL_OWNER_ID IS NOT NULL
       AND p1.BENEFICIAL_OWNER_ID = p2.BENEFICIAL_OWNER_ID
 ),
-MATCHED_PAIR AS (
+-- DIMENSION_KEY-aware calibration resolution for the matched-pair candidate shape (review
+-- finding: the original join matched on JURISDICTION_ID/VENUE_ID only, with no awareness that
+-- DETECTOR_CALIBRATION can carry an instrument-specific override -- 04_position_limit.sql already
+-- has to guard against exactly this. Resolved as its own step, before the time/price filter below,
+-- so exactly one calibration row -- the most specific one that actually matches this instrument
+-- and venue -- governs both the threshold check and the exemption lookup for this pair. Without
+-- this, seeding an instrument-specific override alongside a venue-wide default would let a pair
+-- pass using whichever matched row happens to be most lenient, or silently double every candidate.
+MATCHED_PAIR_CALIB AS (
     SELECT
         t1.TRADE_ID AS TRADE_ID_1, t2.TRADE_ID AS TRADE_ID_2,
         t1.JURISDICTION_ID, t1.VENUE_ID, t1.INSTRUMENT_ID,
@@ -61,7 +69,8 @@ MATCHED_PAIR AS (
         t1.EXECUTION_TIMESTAMP AS EXECUTION_TIMESTAMP_1, t2.EXECUTION_TIMESTAMP AS EXECUTION_TIMESTAMP_2,
         t1.PRICE AS PRICE_1, t2.PRICE AS PRICE_2,
         t1.MATCHING_MECHANISM,
-        'cross_row_matched_pair' AS CANDIDATE_TYPE
+        'cross_row_matched_pair' AS CANDIDATE_TYPE,
+        c.PARAMS AS CALIB_PARAMS
     FROM LIVE_TRADES t1
     JOIN LIVE_TRADES t2
         ON t2.INSTRUMENT_ID = t1.INSTRUMENT_ID
@@ -71,11 +80,28 @@ MATCHED_PAIR AS (
     JOIN ORDERS_CURRENT o2 ON o2.ORDER_ID = t2.ORDER_ID AND o2.VENUE_ID = t2.VENUE_ID
     JOIN MARKET_PARTICIPANTS_CURRENT p1 ON p1.PARTICIPANT_ID = t1.PARTICIPANT_ID AND p1.JURISDICTION_ID = t1.JURISDICTION_ID
     JOIN MARKET_PARTICIPANTS_CURRENT p2 ON p2.PARTICIPANT_ID = t2.PARTICIPANT_ID AND p2.JURISDICTION_ID = t2.JURISDICTION_ID
-    JOIN CALIB c ON c.JURISDICTION_ID = t1.JURISDICTION_ID AND (c.VENUE_ID = t1.VENUE_ID OR c.VENUE_ID IS NULL)
+    JOIN CALIB c ON c.JURISDICTION_ID = t1.JURISDICTION_ID
+        AND (c.VENUE_ID = t1.VENUE_ID OR c.VENUE_ID IS NULL)
+        AND (c.DIMENSION_KEY = t1.INSTRUMENT_ID OR c.DIMENSION_KEY IS NULL)
     WHERE o1.SIDE IS NOT NULL AND o2.SIDE IS NOT NULL AND o1.SIDE != o2.SIDE
       AND p1.BENEFICIAL_OWNER_ID IS NOT NULL AND p1.BENEFICIAL_OWNER_ID = p2.BENEFICIAL_OWNER_ID
-      AND ABS(DATEDIFF('second', t1.EXECUTION_TIMESTAMP, t2.EXECUTION_TIMESTAMP)) <= c.PARAMS:time_window_seconds::NUMBER
-      AND ABS(t1.PRICE - t2.PRICE) <= (c.PARAMS:price_tolerance_pct::FLOAT * t1.PRICE)
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY t1.TRADE_ID, t2.TRADE_ID
+        ORDER BY (c.VENUE_ID IS NULL) ASC, (c.DIMENSION_KEY IS NULL) ASC
+    ) = 1
+),
+-- Threshold check applied AFTER calibration resolution, against that single resolved row only --
+-- not "does any matching calibration's threshold pass," which would let a lenient fallback
+-- override a stricter instrument-specific one that should govern exclusively.
+MATCHED_PAIR AS (
+    SELECT
+        TRADE_ID_1, TRADE_ID_2, JURISDICTION_ID, VENUE_ID, INSTRUMENT_ID,
+        PARTICIPANT_ID_1, PARTICIPANT_ID_2, BENEFICIAL_OWNER_ID,
+        EXECUTION_TIMESTAMP_1, EXECUTION_TIMESTAMP_2, PRICE_1, PRICE_2,
+        MATCHING_MECHANISM, CANDIDATE_TYPE
+    FROM MATCHED_PAIR_CALIB
+    WHERE ABS(DATEDIFF('second', EXECUTION_TIMESTAMP_1, EXECUTION_TIMESTAMP_2)) <= CALIB_PARAMS:time_window_seconds::NUMBER
+      AND ABS(PRICE_1 - PRICE_2) <= (CALIB_PARAMS:price_tolerance_pct::FLOAT * PRICE_1)
 )
 SELECT
     s.*,
@@ -99,8 +125,17 @@ FROM (
     UNION ALL
     SELECT * FROM MATCHED_PAIR
 ) s
+-- Both ec/mc are also DIMENSION_KEY-aware and QUALIFY-deduped now (same review finding as above,
+-- applied here too -- SELF_TRADE rows never resolved a calibration row at all before reaching
+-- this join, so this is the only dedup point that covers them).
 LEFT JOIN CALIB ec ON ec.JURISDICTION_ID = s.JURISDICTION_ID AND ec.VENUE_ID = s.VENUE_ID
-LEFT JOIN CALIB mc ON mc.JURISDICTION_ID = s.JURISDICTION_ID AND mc.VENUE_ID IS NULL;
+    AND (ec.DIMENSION_KEY = s.INSTRUMENT_ID OR ec.DIMENSION_KEY IS NULL)
+LEFT JOIN CALIB mc ON mc.JURISDICTION_ID = s.JURISDICTION_ID AND mc.VENUE_ID IS NULL
+    AND (mc.DIMENSION_KEY = s.INSTRUMENT_ID OR mc.DIMENSION_KEY IS NULL)
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY s.TRADE_ID_1, s.TRADE_ID_2
+    ORDER BY (ec.DIMENSION_KEY IS NULL) ASC, (mc.DIMENSION_KEY IS NULL) ASC
+) = 1;
 
 -- WASH_DETECTION_COVERAGE (Fix #3) -- per VENUE_ID per day, the percentage of trades with a
 -- resolvable counterparty (either ORDER_ID resolves to a participant, or COUNTERPARTY_PARTICIPANT_ID

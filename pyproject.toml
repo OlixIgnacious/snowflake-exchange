@@ -17,6 +17,8 @@ dev = [
     "nbformat>=5.10",
     "pandas>=2.2",
     "tabulate>=0.9",
+    "streamlit>=1.57",
+    "snowflake-snowpark-python>=1.23",
 ]
 
 [tool.pytest.ini_options]

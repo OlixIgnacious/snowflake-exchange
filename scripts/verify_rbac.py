@@ -34,8 +34,11 @@ CHECKS += [
 ]
 
 CHECKS += [
-    ("GOVERNANCE_WRITE", "INSERT OBLIGATION_MAP (proposed row)",
-     f"INSERT INTO OBLIGATION_MAP SELECT 'ZZTEST_OB1','ZZ','rbac test obligation',NULL,NULL,NULL,'proposed',{NOW},'rbactest',{NOW},'rbactest'",
+    ("GOVERNANCE_WRITE", "Direct INSERT OBLIGATION_MAP (must fail -- Fix #6/#30 gate-bypass close, review finding 1)",
+     f"INSERT INTO OBLIGATION_MAP SELECT 'ZZTEST_OB_BYPASS','ZZ','attempted raw insert','TRADES','TRADE_ID','wash_trading','approved',{NOW},'rbactest',{NOW},'rbactest'",
+     "fail"),
+    ("GOVERNANCE_WRITE", "CALL SP_PROPOSE_OBLIGATION (the real, structural write path)",
+     "CALL SP_PROPOSE_OBLIGATION('ZZTEST_OB1', 'ZZ', 'rbac test obligation', NULL, NULL, NULL)",
      "pass"),
     ("GOVERNANCE_WRITE", "SELECT base OBLIGATION_MAP (can see proposed rows)", "SELECT * FROM OBLIGATION_MAP WHERE OBLIGATION_ID = 'ZZTEST_OB1'", "pass"),
     ("GOVERNANCE_WRITE", "INSERT RULE_CORPUS",
@@ -73,7 +76,8 @@ CHECKS += [
 ]
 
 CHECKS += [
-    ("OFFICER_SIGNOFF", "CALL SP_RECORD_SIGNOFF", "CALL SP_RECORD_SIGNOFF('ZZTEST_RUN1', 'approved', 'rbactest')", "pass"),
+    ("OFFICER_SIGNOFF", "CALL SP_RECORD_SIGNOFF (SIGNOFF_BY now bound to CURRENT_USER(), not caller-supplied)",
+     "CALL SP_RECORD_SIGNOFF('ZZTEST_RUN1', 'approved')", "pass"),
     ("OFFICER_SIGNOFF", "INSERT AUDIT_LOG directly (must fail -- no direct table grant)",
      f"INSERT INTO AUDIT_LOG SELECT 'ZZTEST_RUN2','tester','test',NULL,NULL,NULL,NULL,NULL,TRUE,NULL,NULL,NULL,NULL,{NOW},'rbactest',{NOW},'rbactest'",
      "fail"),
@@ -110,6 +114,25 @@ def main():
         print(line)
 
     cur.execute("USE ROLE ACCOUNTADMIN")
+
+    # OFFICER_SIGNOFF identity check (review finding: SP_RECORD_SIGNOFF's SIGNOFF_BY is now
+    # un-spoofable via CURRENT_USER(), but that only means something if the role itself is only
+    # ever granted to a real human -- never to an automation identity). EXPECTED_HUMAN_SIGNOFF_
+    # USERS is the allow-list; anything else granted this role is a MISMATCH.
+    EXPECTED_HUMAN_SIGNOFF_USERS = {"ASHWINISHARMA0807"}
+    cur.execute("SHOW GRANTS OF ROLE OFFICER_SIGNOFF")
+    grantee_users = {row[3] for row in cur.fetchall() if row[2] == "USER"}
+    unexpected = grantee_users - EXPECTED_HUMAN_SIGNOFF_USERS
+    missing = EXPECTED_HUMAN_SIGNOFF_USERS - grantee_users
+    if unexpected or missing:
+        verdict = "MISMATCH"
+    else:
+        verdict = "OK"
+    line = (f"[{verdict}] OFFICER_SIGNOFF grantees are exactly the expected human user(s) "
+            f"-> expected {sorted(EXPECTED_HUMAN_SIGNOFF_USERS)}, got {sorted(grantee_users)}")
+    results.append((verdict, line))
+    print(line)
+
     mismatches = [r for v, r in results if v == "MISMATCH"]
     print(f"\n{len(results)} checks run, {len(mismatches)} mismatch(es).")
     conn.close()
