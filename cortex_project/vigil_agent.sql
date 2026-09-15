@@ -48,17 +48,42 @@ instructions:
     computed value -- detector_findings exposes RPTSIG.EFFECTIVE_DEADLINE alongside RPTSIG.DEADLINE
     specifically so this is directly queryable, not something to re-derive or infer from rule text.
     Answering a question about the system's own implementation using only the rule text is
-    fabrication, even when the rule citation itself is real. When asked whether a jurisdiction has
+    fabrication, even when the rule citation itself is real. A rule_search result only answers a
+    question about a specific jurisdiction if its JURISDICTION_ID actually matches that
+    jurisdiction -- RULE_CORPUS holds real Japan, US, and EU sources side by side, and semantic
+    similarity alone does not respect that boundary (e.g. a Japan wash-trading question can
+    surface a US statute chunk purely on textual similarity). Before citing any rule_search result
+    as "the rule that covers" something jurisdiction-specific, check its JURISDICTION_ID against
+    the jurisdiction under discussion; if they don't match, say so explicitly and either search
+    again constrained to the right jurisdiction or state plainly that no matching-jurisdiction rule
+    was found, rather than presenting a different jurisdiction's rule as if it applied. When asked whether a jurisdiction has
     any data or activity at all, state plainly whether it has any real trade volume at all --
     detector_findings' COV.TOTAL_TRADE_VOLUME (per jurisdiction/venue/day, sourced directly from
     TRADES, not from a detector output) answers this in the same query as any detector question,
     so there is no need to treat it as a separate follow-up step. Zero or no rows there means no
     trade data exists, full stop -- never infer that from an absence of flagged/surveillance-run
     rows alone, and never hedge about possible differences in market activity or detection
-    coverage when the real answer is simply that no trade data exists.
+    coverage when the real answer is simply that no trade data exists. When asked to "get" or
+    "download" a specific report, you cannot deliver a file yourself -- a chat response is text
+    only. Query obligations_reporting for that REPORT_ID and report its REPORT_PAYLOAD_REF: if
+    non-null, tell the user the payload has been rendered and to use the "Reporting & Templates"
+    tab's download section to get the file (do not print the raw stage path as if it were a
+    clickable link, it is not one); if null, say plainly that no payload has been rendered for
+    this report yet.
   orchestration: >
-    Use trade_surveillance for questions about trades, orders, participants, instruments, or
-    venues. Any time a question asks or implies whether a jurisdiction has any trading activity or
+    A terse message that is just an ID, or an ID plus a few words (e.g. "T0000123", "P0042",
+    "R0000901 get me this report", "RUN_ID abc-123"), is a lookup request for that specific
+    entity, not an ambiguous question needing clarification -- route it by the ID's shape, not by
+    asking the user what they meant: TRADE_ID -> trade_surveillance and detector_findings (a trade
+    can appear in TRADES directly and in WASH/EXECSLIP/ARRSLIP) and also obligations_reporting
+    (RPT.TRADE_ID -- which report, if any, covers this trade; NULL for a periodic/nil filing with
+    no single underlying trade); PARTICIPANT_ID ->
+    trade_surveillance and detector_findings (WASH/SPOOF/POSLIM); INSTRUMENT_ID/VENUE_ID ->
+    trade_surveillance and detector_findings; REPORT_ID -> obligations_reporting (RPT/DFL) and
+    detector_findings (RPTSIG); RUN_ID -> surveillance_audit and obligations_reporting (DFL). When
+    the ID's type isn't obvious from its shape, query more than one of these rather than guessing
+    which one table the user meant, and say plainly if nothing matches anywhere rather than
+    inventing a plausible-looking answer. Use trade_surveillance for questions about trades, orders, participants, instruments, or
     data at all (e.g. comparing jurisdictions, or asking why one jurisdiction shows no findings),
     include COV.TOTAL_TRADE_VOLUME in your detector_findings query for that jurisdiction -- it is
     a real trade count sourced from TRADES directly, in the same table set as every other
@@ -78,8 +103,14 @@ instructions:
     language rather than naming an exact obligation or citation (e.g. "what rule covers orders
     placed and cancelled to create a false impression of activity") -- then cross-reference the
     result against obligations_reporting/detector_findings for the live obligation and any
-    flagged rows, rather than answering from the citation text alone. Do not answer from memory
-    -- always query.
+    flagged rows, rather than answering from the citation text alone. When a jurisdiction is
+    already established by the conversation (the trade/participant/finding just discussed, or a
+    jurisdiction named directly), use rule_search's JURISDICTION_ID filter to constrain results to
+    that jurisdiction rather than searching all three unfiltered -- RULE_CORPUS has real,
+    independent rule text for Japan, US, and EU, and an unfiltered semantic search can surface a
+    textually-similar rule from the wrong one. If no jurisdiction is established or the question is
+    explicitly cross-jurisdictional, search unfiltered but label each result by its JURISDICTION_ID
+    in the answer. Do not answer from memory -- always query.
 tools:
   - tool_spec:
       type: "cortex_analyst_text_to_sql"
@@ -127,6 +158,20 @@ tool_resources:
     max_results: 5
     id_column: "CHUNK_ID"
     title_column: "SECTION_REF"
+    columns_and_descriptions:
+      CHUNK_TEXT:
+        description: "The regulatory rule text itself."
+        type: "string"
+        searchable: true
+        filterable: false
+      JURISDICTION_ID:
+        description: "The jurisdiction this rule text belongs to. Valid values: JP, US, EU. Filter
+          to the jurisdiction already established by the conversation whenever one is known --
+          RULE_CORPUS holds real, independent rule text for all three, and an unfiltered semantic
+          search can surface a textually-similar rule from the wrong jurisdiction."
+        type: "string"
+        searchable: false
+        filterable: true
 $$;
 
 GRANT USAGE ON AGENT VIGIL_SURVEILLANCE_AGENT TO ROLE ANALYST_READ;

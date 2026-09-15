@@ -26,6 +26,8 @@ CREATE OR REPLACE SEMANTIC VIEW SV_OBLIGATIONS_REPORTING
         RPT.REPORT_STATUS AS RPT.REPORT_STATUS,
         RPT.REPORT_SCOPE AS RPT.REPORT_SCOPE,
         RPT.MATCH_STATUS AS RPT.MATCH_STATUS,
+        RPT.TRADE_ID AS RPT.TRADE_ID WITH SYNONYMS ('trade', 'trade id') COMMENT = 'Logical FK -> TRADES.TRADE_ID -- which trade this report covers. NULL when REPORT_SCOPE != trade (a periodic/nil filing has no single underlying trade). Not part of this table''s own PRIMARY KEY (REPORT_ID, JURISDICTION_ID), so it needs an explicit DIMENSION entry to be filterable/askable at all -- without this, "which report covers trade X" has no answer even though the base table has always carried TRADE_ID.',
+        RPT.REPORT_PAYLOAD_REF AS RPT.REPORT_PAYLOAD_REF WITH SYNONYMS ('payload', 'payload file', 'report file', 'download link', 'submission artifact') COMMENT = 'Stage path to the generated submission artifact (Fix #25); NULL until SP_RENDER_REPORT_PAYLOAD/SP_RENDER_REPORT_PAYLOAD_XML has rendered one for this report. Not a browser-downloadable URL -- direct the user to the dashboard''s Reporting & Templates tab to actually download the file; this dimension only tells you whether a payload has been rendered.',
         TMPL.FIELD_STATUS AS TMPL.STATUS,
         OBL.DETECTOR_NAME AS OBL.DETECTOR_NAME,
         DFL.REPORT_ID AS DFL.REPORT_ID,
