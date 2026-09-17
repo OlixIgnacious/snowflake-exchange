@@ -85,8 +85,16 @@ MATCHED_PAIR_CALIB AS (
         AND (c.DIMENSION_KEY = t1.INSTRUMENT_ID OR c.DIMENSION_KEY IS NULL)
     WHERE o1.SIDE IS NOT NULL AND o2.SIDE IS NOT NULL AND o1.SIDE != o2.SIDE
       AND p1.BENEFICIAL_OWNER_ID IS NOT NULL AND p1.BENEFICIAL_OWNER_ID = p2.BENEFICIAL_OWNER_ID
+    -- JURISDICTION_ID in the partition key (Fix #33): TRADE_ID is generator-assigned per
+    -- jurisdiction, not globally unique (confirmed live 2026-09-17 -- a real trade in one
+    -- jurisdiction can share its TRADE_ID with an unrelated trade in another purely by
+    -- coincidence). Without it, two different jurisdictions' matched pairs that happen to land on
+    -- the same (TRADE_ID_1, TRADE_ID_2) value would compete for the same ROW_NUMBER()=1 slot here
+    -- and one would be silently dropped -- the t1/t2 JOIN above already pins each individual pair
+    -- to one jurisdiction, but does nothing to stop a *different* jurisdiction's pair from
+    -- colliding with it on this dedup key.
     QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY t1.TRADE_ID, t2.TRADE_ID
+        PARTITION BY t1.JURISDICTION_ID, t1.TRADE_ID, t2.TRADE_ID
         ORDER BY (c.VENUE_ID IS NULL) ASC, (c.DIMENSION_KEY IS NULL) ASC
     ) = 1
 ),
@@ -132,8 +140,15 @@ LEFT JOIN CALIB ec ON ec.JURISDICTION_ID = s.JURISDICTION_ID AND ec.VENUE_ID = s
     AND (ec.DIMENSION_KEY = s.INSTRUMENT_ID OR ec.DIMENSION_KEY IS NULL)
 LEFT JOIN CALIB mc ON mc.JURISDICTION_ID = s.JURISDICTION_ID AND mc.VENUE_ID IS NULL
     AND (mc.DIMENSION_KEY = s.INSTRUMENT_ID OR mc.DIMENSION_KEY IS NULL)
+-- JURISDICTION_ID in the partition key (Fix #33, same root cause as MATCHED_PAIR_CALIB's QUALIFY
+-- above): without it, a SELF_TRADE or MATCHED_PAIR row from one jurisdiction silently competed
+-- with an unrelated row from another jurisdiction for this ROW_NUMBER()=1 slot whenever their
+-- (TRADE_ID_1, TRADE_ID_2) happened to coincide -- confirmed live, 5 distinct TRADE_IDs affected
+-- among same-row self-trade candidates alone (T0000730, T0000882, T0000559, T0000169, T0000853),
+-- each hiding a real, distinct finding in a second jurisdiction, with an unstable ORDER BY tie
+-- deciding (non-deterministically across query compilations) which one survived.
 QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY s.TRADE_ID_1, s.TRADE_ID_2
+    PARTITION BY s.JURISDICTION_ID, s.TRADE_ID_1, s.TRADE_ID_2
     ORDER BY (ec.DIMENSION_KEY IS NULL) ASC, (mc.DIMENSION_KEY IS NULL) ASC
 ) = 1;
 

@@ -83,7 +83,20 @@ instructions:
     detector_findings (RPTSIG); RUN_ID -> surveillance_audit and obligations_reporting (DFL). When
     the ID's type isn't obvious from its shape, query more than one of these rather than guessing
     which one table the user meant, and say plainly if nothing matches anywhere rather than
-    inventing a plausible-looking answer. Use trade_surveillance for questions about trades, orders, participants, instruments, or
+    inventing a plausible-looking answer. Every entity ID in this schema (TRADE_ID, ORDER_ID,
+    PARTICIPANT_ID, INSTRUMENT_ID, REPORT_ID, RUN_ID) is assigned independently per JURISDICTION_ID
+    by the synthetic generator and is unique only within its own jurisdiction, never globally --
+    the same ID string (e.g. "T0000853") routinely refers to a completely unrelated trade in each
+    of JP/US/EU purely by coincidence, with different venues, instruments, participants, prices,
+    and dates. A bare-ID lookup that matches rows in more than one JURISDICTION_ID is matching
+    multiple unrelated entities, not one entity that spans jurisdictions -- never describe it as
+    "executed in multiple jurisdictions" or similar. If a jurisdiction is already established by
+    the conversation (named directly, or the only one discussed so far), filter the lookup to that
+    JURISDICTION_ID and answer about that jurisdiction's match only. If no jurisdiction is
+    established and the ID matches in more than one, present each jurisdiction's match separately,
+    each clearly labeled by its own JURISDICTION_ID, and say plainly that they are unrelated
+    entities that happen to share an ID string -- do not merge their fields (venue, instrument,
+    participant, findings) into a single narrative. Use trade_surveillance for questions about trades, orders, participants, instruments, or
     data at all (e.g. comparing jurisdictions, or asking why one jurisdiction shows no findings),
     include COV.TOTAL_TRADE_VOLUME in your detector_findings query for that jurisdiction -- it is
     a real trade count sourced from TRADES directly, in the same table set as every other

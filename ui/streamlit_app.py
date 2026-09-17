@@ -1,29 +1,32 @@
 """Vigil dashboard -- Streamlit in Snowflake (Phase 8 demo layer, plan.md; workflow-stage +
-case-centric redesign, 2026-09-16).
+case-centric redesign, 2026-09-16; role-switching removed 2026-09-17 -- see below).
 
-Runs inside Snowflake (Snowsight), using the viewer's own role via `get_active_session()`. The
-app forces its *resting* role to ANALYST_READ (SELECT everywhere, no write access anywhere --
-architecture.md's RBAC section) on every read, and only ever leaves that role for the duration of
-one explicit persona action below (`acting_as(...)`), always switching back immediately after --
-this app never widens ANALYST_READ's own grants; it switches to a role that already, natively,
-holds whatever grant the action needs (sql/rbac/01_roles.sql grants all 5 functional roles
-directly to the account that runs this app, so every `USE ROLE` below is real RBAC enforcement,
-not a UI simulation).
+Runs inside Snowflake (Snowsight) via `get_active_session()`. This is a *warehouse-runtime*
+Streamlit-in-Snowflake app, which Snowflake always executes with the app **owner's** rights --
+every query this app issues runs as the role that owns the `STREAMLIT` object (here,
+`ACCOUNTADMIN`, per `SHOW STREAMLITS`), never as the viewer's role, and `CURRENT_ROLE()` inside
+this session always returns the owner regardless (Snowflake's own docs: "Streamlit in Snowflake
+Security overview"). A previous version of this file tried to work around that with
+`USE SECONDARY ROLES NONE` / `USE ROLE <x>` per persona action (`acting_as(...)`, now removed) --
+that is not a workaround, it is flatly rejected by this runtime: `Unsupported statement type
+'USE'` (confirmed live, 2026-09-17). `streamlit.testing.v1.AppTest`, used for every prior review of
+this file, runs against an ordinary Snowflake session where `USE ROLE` works fine -- it cannot
+catch this, which is exactly why it wasn't caught until a real Snowsight session hit it (the one
+gap TRACKER.md's Phase 8 entry already flagged as unverified).
 
-That enforcement claim depends on one thing that's easy to miss: this account defaults every
-session to secondary roles = ALL (confirmed live via `SELECT CURRENT_SECONDARY_ROLES()`), which
-means a session's *active* (primary) role restricts nothing by itself -- every grant from every
-role the connected user holds is available simultaneously regardless of which role is "current."
-Found this the hard way: a live negative-check test (calling a write procedure while on
-ANALYST_READ, expecting it to be rejected) unexpectedly succeeded. `USE SECONDARY ROLES NONE`
-below is what makes `USE ROLE` below actually mean something -- without it, the whole persona
-switcher would still run without errors, but every `acting_as(...)` block would be a no-op label,
-not real enforcement. Self-contained in one file (no import of this repo's other modules) since a
-Streamlit-in-Snowflake stage only ships the files explicitly uploaded to it -- see NOTES.md for
-the deployment record.
+Practical effect: every governed write action below now goes straight to its stored procedure with
+no role switch in front of it. That is *still* real RBAC enforcement, not a UI simulation, for
+every procedure except one -- every `SP_*` procedure this file calls is `EXECUTE AS OWNER` (so its
+body's privileges are fixed at the procedure, independent of caller) with the single exception of
+`SP_APPROVE_OBLIGATION`, which is deliberately `EXECUTE AS CALLER` (sql/procedures/
+sp_approve_obligation.sql) -- from *this* app, "caller" now means the app owner (ACCOUNTADMIN),
+not `GOVERNANCE_WRITE`, for exactly the reason above. That is a real, separate gap this crash
+surfaced, tracked in NOTES.md, not silently worked around here.
+
+Self-contained in one file (no import of this repo's other modules) since a Streamlit-in-Snowflake
+stage only ships the files explicitly uploaded to it -- see NOTES.md for the deployment record.
 """
 import json
-from contextlib import contextmanager
 
 import pandas as pd
 import streamlit as st
@@ -31,8 +34,6 @@ from snowflake.snowpark.context import get_active_session
 
 st.set_page_config(page_title="Vigil", layout="wide")
 session = get_active_session()
-session.sql("USE SECONDARY ROLES NONE").collect()
-session.sql("USE ROLE ANALYST_READ").collect()
 
 AGENT_FQN = "VIGIL.CORE.VIGIL_SURVEILLANCE_AGENT"
 
@@ -47,20 +48,6 @@ def q_params(sql: str, params: tuple) -> pd.DataFrame:
     """Same as q(), bind-parameterized -- used wherever a query embeds free-text user input (a
     case-search box) rather than a value constrained to a selectbox's own DB-backed options."""
     return session.sql(sql, params=list(params)).to_pandas()
-
-
-@contextmanager
-def acting_as(role: str):
-    """Switches this shared session's active Snowflake role for one write action, then always
-    switches back to ANALYST_READ -- success or failure -- so the session's resting state is
-    always least-privilege. Every role this ever switches to already, natively, holds the grant
-    the action inside the block needs (see module docstring); this never grants ANALYST_READ
-    anything new."""
-    session.sql(f"USE ROLE {role}").collect()
-    try:
-        yield
-    finally:
-        session.sql("USE ROLE ANALYST_READ").collect()
 
 
 def download_csv_button(df: pd.DataFrame, label: str, key: str) -> None:
@@ -118,6 +105,15 @@ def send_chat_message(prompt_text: str) -> tuple[str, list[dict]]:
         {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
         for m in st.session_state.chat_messages
     ]
+    # The sidebar's jurisdiction selection never reaches the agent any other way -- stamping it
+    # onto the outgoing turn (not onto what's stored/displayed in chat_messages, which stays
+    # exactly what the user typed) is what lets vigil_agent.sql's "jurisdiction already
+    # established by the conversation" bare-ID routing instruction actually fire for a question
+    # like "T0000853" typed right after picking JP, instead of falling back to listing every
+    # jurisdiction's coincidentally-same-ID match. Re-stamped on every turn, not just the first,
+    # so a jurisdiction change mid-conversation via the sidebar takes precedence over an earlier
+    # turn's stale context.
+    api_messages[-1]["content"][0]["text"] = f"[Selected jurisdiction: {jurisdiction_id}] {prompt_text}"
     try:
         answer, citations = extract_answer_and_citations(ask_agent(api_messages))
     except Exception as e:
@@ -154,13 +150,16 @@ st.caption(
 )
 
 jurisdictions = q("SELECT JURISDICTION_ID FROM JURISDICTIONS_CURRENT ORDER BY 1")
-jurisdiction_id = st.sidebar.selectbox(
-    "Jurisdiction",
-    jurisdictions["JURISDICTION_ID"] if not jurisdictions.empty else ["JP"],
-    index=None,
-    placeholder="Select a jurisdiction…",
+_SELECT_PROMPT = "— Select a jurisdiction —"
+_jurisdiction_options = [_SELECT_PROMPT] + list(
+    jurisdictions["JURISDICTION_ID"] if not jurisdictions.empty else ["JP"]
 )
-if jurisdiction_id is None:
+# Deliberately the plainest possible selectbox call (label, options, implicit index=0) --
+# Snowflake's warehouse-runtime Streamlit hosting engine bundles a Streamlit version old enough to
+# reject both `index=None` and `placeholder=` (confirmed live, 2026-09-17); a leading sentinel
+# option standing in for "nothing selected yet" needs no version-specific keyword at all.
+jurisdiction_id = st.sidebar.selectbox("Jurisdiction", _jurisdiction_options)
+if jurisdiction_id == _SELECT_PROMPT:
     st.info("Select a jurisdiction from the sidebar to load data.")
     st.stop()
 
@@ -194,7 +193,7 @@ with tabs[0]:
         SELECT VENUE_ID, VENUE_TYPE, STATUS, ACTIVE_FROM, DISCONTINUED_AT
         FROM VENUES_CURRENT WHERE JURISDICTION_ID = '{jurisdiction_id}' ORDER BY STATUS, VENUE_ID
     """)
-    st.dataframe(venues, width='stretch')
+    st.dataframe(venues, use_container_width=True)
     download_csv_button(venues, "Download CSV", f"venues_{jurisdiction_id}")
     st.caption(
         "Discontinued venues (DISCONTINUED_AT populated) keep their historical trades fully "
@@ -230,7 +229,7 @@ with tabs[1]:
         """, (jurisdiction_id, search_id, search_id, search_id, search_id, search_id))
         if not trade_hits.empty:
             st.write(f"Trades ({len(trade_hits)})")
-            st.dataframe(trade_hits, width='stretch')
+            st.dataframe(trade_hits, use_container_width=True)
             download_csv_button(trade_hits, "Download CSV", f"trades_{search_id}")
 
             report_hits = q_params("""
@@ -246,7 +245,7 @@ with tabs[1]:
             if not report_hits.empty:
                 st.write("Reports covering these trades")
                 st.caption("Search the REPORT_ID below in the Report tab for its full status and download.")
-                st.dataframe(report_hits, width='stretch')
+                st.dataframe(report_hits, use_container_width=True)
                 download_csv_button(report_hits, "Download CSV", f"reports_for_{search_id}")
             else:
                 st.info("No transaction report references any of these trades yet.")
@@ -291,23 +290,23 @@ with tabs[1]:
         else:
             if not wash_hits.empty:
                 st.write("Wash-trading candidates")
-                st.dataframe(wash_hits, width='stretch')
+                st.dataframe(wash_hits, use_container_width=True)
                 download_csv_button(wash_hits, "Download CSV", f"wash_{search_id}")
             if not spoof_hits.empty:
                 st.write("Spoofing / layering signals")
-                st.dataframe(spoof_hits, width='stretch')
+                st.dataframe(spoof_hits, use_container_width=True)
                 download_csv_button(spoof_hits, "Download CSV", f"spoof_{search_id}")
             if not poslim_hits.empty:
                 st.write("Position-limit breaches")
-                st.dataframe(poslim_hits, width='stretch')
+                st.dataframe(poslim_hits, use_container_width=True)
                 download_csv_button(poslim_hits, "Download CSV", f"poslim_{search_id}")
             if not exec_hits.empty:
                 st.write("Execution slippage")
-                st.dataframe(exec_hits, width='stretch')
+                st.dataframe(exec_hits, use_container_width=True)
                 download_csv_button(exec_hits, "Download CSV", f"execslip_{search_id}")
             if not arrival_hits.empty:
                 st.write("Arrival slippage")
-                st.dataframe(arrival_hits, width='stretch')
+                st.dataframe(arrival_hits, use_container_width=True)
                 download_csv_button(arrival_hits, "Download CSV", f"arrslip_{search_id}")
         ask_chat_inline(search_id, key="investigate")
     else:
@@ -328,7 +327,7 @@ with tabs[1]:
                 FROM WASH_TRADING_CANDIDATES WHERE JURISDICTION_ID = '{jurisdiction_id}'
                 ORDER BY IS_TRIGGER_EXEMPT, VENUE_ID
             """)
-            st.dataframe(wash, width='stretch')
+            st.dataframe(wash, use_container_width=True)
             download_csv_button(wash, "Download CSV", f"wash_{jurisdiction_id}")
             null_exempt = wash["IS_TRIGGER_EXEMPT"].isna().sum() if not wash.empty else 0
             if null_exempt:
@@ -343,7 +342,7 @@ with tabs[1]:
                 FROM WASH_DETECTION_COVERAGE WHERE JURISDICTION_ID = '{jurisdiction_id}'
                 ORDER BY PCT_TRADES_WITH_RESOLVABLE_COUNTERPARTY ASC
             """)
-            st.dataframe(coverage, width='stretch')
+            st.dataframe(coverage, use_container_width=True)
             download_csv_button(coverage, "Download CSV", f"wash_coverage_{jurisdiction_id}")
 
         elif detector == "Spoofing / Layering":
@@ -364,7 +363,7 @@ with tabs[1]:
                     ORDER BY EVENT_DATE
                 """)
                 st.line_chart(spoof.set_index("EVENT_DATE")[["CANCEL_RATIO", "CANCEL_RATIO_ZSCORE"]])
-                st.dataframe(spoof, width='stretch')
+                st.dataframe(spoof, use_container_width=True)
                 download_csv_button(spoof, "Download CSV", f"spoof_{pid}")
             else:
                 st.info("No spoofing signal rows for this jurisdiction.")
@@ -375,7 +374,7 @@ with tabs[1]:
                 FROM SPOOFING_LAYERING_SIGNALS WHERE JURISDICTION_ID = '{jurisdiction_id}' AND IS_FLAGGED
                 ORDER BY CANCEL_RATIO_ZSCORE DESC
             """)
-            st.dataframe(flagged, width='stretch')
+            st.dataframe(flagged, use_container_width=True)
             download_csv_button(flagged, "Download CSV", f"spoof_flagged_{jurisdiction_id}")
 
         elif detector == "Position Limits":
@@ -386,7 +385,7 @@ with tabs[1]:
                 FROM POSITION_LIMIT_BREACHES WHERE JURISDICTION_ID = '{jurisdiction_id}'
                 ORDER BY PCT_OF_LIMIT DESC
             """)
-            st.dataframe(pos, width='stretch')
+            st.dataframe(pos, use_container_width=True)
             download_csv_button(pos, "Download CSV", f"poslim_{jurisdiction_id}")
             if not pos.empty:
                 st.bar_chart(pos.set_index("PARTICIPANT_ID")["PCT_OF_LIMIT"].head(20))
@@ -404,26 +403,25 @@ with tabs[1]:
                 )
             else:
                 st.write("Execution slippage")
-                st.dataframe(exec_slip, width='stretch')
+                st.dataframe(exec_slip, use_container_width=True)
                 download_csv_button(exec_slip, "Download CSV", f"execslip_{jurisdiction_id}")
                 st.write("Arrival slippage")
-                st.dataframe(arrival_slip, width='stretch')
+                st.dataframe(arrival_slip, use_container_width=True)
                 download_csv_button(arrival_slip, "Download CSV", f"arrslip_{jurisdiction_id}")
 
     st.divider()
-    with st.expander("Surveillance Operator: log an official run (acts as AUDIT_INSERT)"):
+    with st.expander("Surveillance Operator: log an official run (SP_LOG_SURVEILLANCE_RUN, EXECUTE AS OWNER)"):
         st.caption(
             "Runs the same five detector counts shown across this app through "
             "SP_LOG_SURVEILLANCE_RUN and writes one append-only row per detector to the audit "
-            "trail (visible in Sign off & Submit). This really switches this session's Snowflake "
-            "role to AUDIT_INSERT for the call, then back to ANALYST_READ immediately after — "
-            "not a UI simulation."
+            "trail (visible in Sign off & Submit). RBAC enforcement here is at the procedure, not "
+            "this session's role: SP_LOG_SURVEILLANCE_RUN is EXECUTE AS OWNER, so its write scope "
+            "is fixed at the procedure regardless of who calls it."
         )
         if st.button(f"Log a surveillance run for {jurisdiction_id}", key="run_audit_btn"):
-            with st.spinner("Switching role to AUDIT_INSERT and logging…"):
+            with st.spinner("Logging surveillance run…"):
                 try:
-                    with acting_as("AUDIT_INSERT"):
-                        session.sql("CALL SP_LOG_SURVEILLANCE_RUN(?)", params=[jurisdiction_id]).collect()
+                    session.sql("CALL SP_LOG_SURVEILLANCE_RUN(?)", params=[jurisdiction_id]).collect()
                     q.clear()
                     q_params.clear()
                     st.success("Logged — see it in Sign off & Submit.")
@@ -452,7 +450,7 @@ with tabs[2]:
         if report_row.empty:
             st.info(f"No report `{search_report_id}` found for {jurisdiction_id}.")
         else:
-            st.dataframe(report_row, width='stretch')
+            st.dataframe(report_row, use_container_width=True)
             download_csv_button(report_row, "Download CSV", f"report_{search_report_id}")
 
             timeliness_row = q_params(
@@ -461,7 +459,7 @@ with tabs[2]:
             )
             if not timeliness_row.empty:
                 st.write("Timeliness / completeness / match status")
-                st.dataframe(timeliness_row, width='stretch')
+                st.dataframe(timeliness_row, use_container_width=True)
                 download_csv_button(timeliness_row, "Download CSV", f"timeliness_{search_report_id}")
 
             payload_ref = report_row.iloc[0].get("REPORT_PAYLOAD_REF")
@@ -488,7 +486,7 @@ with tabs[2]:
               AND (IS_OVERDUE_UNSUBMITTED OR IS_LATE_SUBMISSION OR IS_INCOMPLETE OR IS_MISMATCHED)
             ORDER BY REPORT_ID
         """)
-        st.dataframe(timeliness, width='stretch')
+        st.dataframe(timeliness, use_container_width=True)
         download_csv_button(timeliness, "Download CSV", f"reports_attention_{jurisdiction_id}")
 
         st.write("Template coverage (Fix #28 — the template's own completeness, not one report's)")
@@ -497,7 +495,7 @@ with tabs[2]:
                    PCT_REQUIRED_FIELDS_MAPPED, GAP_FIELD_NAMES
             FROM REPORT_TEMPLATE_COVERAGE WHERE JURISDICTION_ID = '{jurisdiction_id}'
         """)
-        st.dataframe(coverage_tpl, width='stretch')
+        st.dataframe(coverage_tpl, use_container_width=True)
         download_csv_button(coverage_tpl, "Download CSV", f"template_coverage_{jurisdiction_id}")
         for _, row in coverage_tpl.iterrows():
             if row["PCT_REQUIRED_FIELDS_MAPPED"] < 1.0:
@@ -507,7 +505,7 @@ with tabs[2]:
                 )
 
     st.divider()
-    with st.expander("Market Data Ops: render a report payload (acts as MARKET_DATA_INGEST)"):
+    with st.expander("Market Data Ops: render a report payload (SP_RENDER_REPORT_PAYLOAD*, EXECUTE AS OWNER)"):
         unrendered = q_params("""
             SELECT REPORT_ID, REPORT_TYPE FROM TRANSACTION_REPORTS_CURRENT
             WHERE JURISDICTION_ID = ? AND REPORT_PAYLOAD_REF IS NULL ORDER BY REPORT_ID
@@ -519,17 +517,16 @@ with tabs[2]:
             render_fmt = st.radio("Format", ["CSV", "XML"], horizontal=True, key="render_fmt")
             if st.button(f"Render {render_target}", key="render_btn"):
                 proc = "SP_RENDER_REPORT_PAYLOAD" if render_fmt == "CSV" else "SP_RENDER_REPORT_PAYLOAD_XML"
-                with st.spinner(f"Switching role to MARKET_DATA_INGEST and calling {proc}…"):
+                with st.spinner(f"Calling {proc}…"):
                     try:
-                        with acting_as("MARKET_DATA_INGEST"):
-                            session.sql(f"CALL {proc}(?, ?)", params=[render_target, jurisdiction_id]).collect()
+                        session.sql(f"CALL {proc}(?, ?)", params=[render_target, jurisdiction_id]).collect()
                         q.clear()
                         q_params.clear()
                         st.success(f"Rendered — search {render_target} above to download it.")
                     except Exception as e:
                         st.error(f"Failed: {e}")
 
-    with st.expander("Governance Reviewer: propose a new obligation (acts as GOVERNANCE_WRITE)"):
+    with st.expander("Governance Reviewer: propose a new obligation (SP_PROPOSE_OBLIGATION, EXECUTE AS OWNER)"):
         with st.form("propose_obligation_form"):
             p_obligation_id = st.text_input("Obligation ID")
             p_description = st.text_area("Description")
@@ -538,53 +535,57 @@ with tabs[2]:
             p_detector_name = st.text_input("Detector name")
             propose_submitted = st.form_submit_button("Propose")
         if propose_submitted:
-            with st.spinner("Switching role to GOVERNANCE_WRITE and proposing…"):
+            with st.spinner("Proposing…"):
                 try:
-                    with acting_as("GOVERNANCE_WRITE"):
-                        session.sql(
-                            "CALL SP_PROPOSE_OBLIGATION(?, ?, ?, ?, ?, ?)",
-                            params=[p_obligation_id, jurisdiction_id, p_description,
-                                    p_source_table, p_source_columns, p_detector_name],
-                        ).collect()
+                    session.sql(
+                        "CALL SP_PROPOSE_OBLIGATION(?, ?, ?, ?, ?, ?)",
+                        params=[p_obligation_id, jurisdiction_id, p_description,
+                                p_source_table, p_source_columns, p_detector_name],
+                    ).collect()
                     st.success(f"Proposed {p_obligation_id}.")
                 except Exception as e:
                     st.error(f"Failed: {e}")
 
-    with st.expander("Governance Reviewer: approve a pending obligation (acts as GOVERNANCE_WRITE)"):
+    with st.expander("Governance Reviewer: approve a pending obligation (SP_APPROVE_OBLIGATION)"):
         st.caption(
             "ANALYST_READ structurally cannot see a proposed-but-unapproved obligation "
-            "(architecture.md's governance gate) — this list is queried as GOVERNANCE_WRITE."
+            "(architecture.md's governance gate) — this app's own queries run as its Streamlit "
+            "owner role, not ANALYST_READ, which is why this list is visible here at all. "
+            "**Known gap:** SP_APPROVE_OBLIGATION is EXECUTE AS CALLER (sql/procedures/"
+            "sp_approve_obligation.sql), the one governed procedure not EXECUTE AS OWNER — called "
+            "from this app it runs with the app owner's privileges, not GOVERNANCE_WRITE's. "
+            "Real GOVERNANCE_WRITE-scoped approval still works via a direct session with "
+            "`USE ROLE GOVERNANCE_WRITE` (outside Streamlit-in-Snowflake, where role switching "
+            "isn't blocked); see NOTES.md."
         )
         try:
-            with acting_as("GOVERNANCE_WRITE"):
-                pending = session.sql("""
-                    SELECT OBLIGATION_ID, OBLIGATION_DESCRIPTION, SOURCE_TABLE, SOURCE_COLUMNS,
-                           DETECTOR_NAME
-                    FROM OBLIGATION_MAP
-                    WHERE JURISDICTION_ID = ?
-                    QUALIFY ROW_NUMBER() OVER (
-                        PARTITION BY OBLIGATION_ID, JURISDICTION_ID ORDER BY LOADED_AT DESC
-                    ) = 1
-                    AND STATUS = 'proposed'
-                """, params=[jurisdiction_id]).to_pandas()
+            pending = session.sql("""
+                SELECT OBLIGATION_ID, OBLIGATION_DESCRIPTION, SOURCE_TABLE, SOURCE_COLUMNS,
+                       DETECTOR_NAME
+                FROM OBLIGATION_MAP
+                WHERE JURISDICTION_ID = ?
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY OBLIGATION_ID, JURISDICTION_ID ORDER BY LOADED_AT DESC
+                ) = 1
+                AND STATUS = 'proposed'
+            """, params=[jurisdiction_id]).to_pandas()
         except Exception as e:
             pending = pd.DataFrame()
             st.error(f"Could not load pending obligations: {e}")
         if pending.empty:
             st.info("No proposed obligations pending approval for this jurisdiction.")
         else:
-            st.dataframe(pending, width='stretch')
+            st.dataframe(pending, use_container_width=True)
             approve_target = st.selectbox("Obligation to approve", pending["OBLIGATION_ID"], key="approve_target")
             if st.button(f"Approve {approve_target}", key="approve_btn"):
                 row = pending.loc[pending["OBLIGATION_ID"] == approve_target].iloc[0]
-                with st.spinner("Switching role to GOVERNANCE_WRITE and approving…"):
+                with st.spinner("Approving…"):
                     try:
-                        with acting_as("GOVERNANCE_WRITE"):
-                            session.sql(
-                                "CALL SP_APPROVE_OBLIGATION(?, ?, ?, ?, ?, ?)",
-                                params=[approve_target, jurisdiction_id, row["OBLIGATION_DESCRIPTION"],
-                                        row["SOURCE_TABLE"], row["SOURCE_COLUMNS"], row["DETECTOR_NAME"]],
-                            ).collect()
+                        session.sql(
+                            "CALL SP_APPROVE_OBLIGATION(?, ?, ?, ?, ?, ?)",
+                            params=[approve_target, jurisdiction_id, row["OBLIGATION_DESCRIPTION"],
+                                    row["SOURCE_TABLE"], row["SOURCE_COLUMNS"], row["DETECTOR_NAME"]],
+                        ).collect()
                         st.success(f"Approved {approve_target}.")
                     except Exception as e:
                         st.error(f"Failed: {e}")
@@ -620,11 +621,11 @@ with tabs[3]:
         else:
             if not findings_hit.empty:
                 st.write("Assurance verdict")
-                st.dataframe(findings_hit, width='stretch')
+                st.dataframe(findings_hit, use_container_width=True)
                 download_csv_button(findings_hit, "Download CSV", f"findings_{search_id2}")
             if not audit_hit.empty:
                 st.write("Audit trail")
-                st.dataframe(audit_hit, width='stretch')
+                st.dataframe(audit_hit, use_container_width=True)
                 download_csv_button(audit_hit, "Download CSV", f"audit_{search_id2}")
         ask_chat_inline(search_id2, key="signoff")
     else:
@@ -651,7 +652,7 @@ with tabs[3]:
                 st.warning(f"{not_ready} report(s) not ready to submit — see REASONS below.")
             else:
                 st.success("Every documented report is ready to submit.")
-            st.dataframe(findings, width='stretch')
+            st.dataframe(findings, use_container_width=True)
             download_csv_button(findings, "Download CSV", f"findings_{jurisdiction_id}")
 
         st.write("Detector run history")
@@ -674,11 +675,11 @@ with tabs[3]:
                 "timestamp, not a final total, since more scheduled runs may still occur before "
                 "the day ends."
             )
-            st.dataframe(runs, width='stretch')
+            st.dataframe(runs, use_container_width=True)
             download_csv_button(runs, "Download CSV", f"audit_{jurisdiction_id}")
 
     st.divider()
-    with st.expander("Compliance Officer: record a sign-off (acts as OFFICER_SIGNOFF)"):
+    with st.expander("Compliance Officer: record a sign-off (SP_RECORD_SIGNOFF, EXECUTE AS OWNER)"):
         st.caption(
             "SP_RECORD_SIGNOFF binds SIGNOFF_BY to CURRENT_USER() — un-spoofable, the recorded "
             "identity is always whoever's session actually calls it, never an asserted value."
@@ -698,12 +699,11 @@ with tabs[3]:
             )
             decision = st.radio("Decision", ["approved", "rejected"], horizontal=True, key="signoff_decision")
             if st.button("Record sign-off", key="signoff_btn"):
-                with st.spinner("Switching role to OFFICER_SIGNOFF and recording…"):
+                with st.spinner("Recording…"):
                     try:
-                        with acting_as("OFFICER_SIGNOFF"):
-                            session.sql(
-                                "CALL SP_RECORD_SIGNOFF(?, ?)", params=[signoff_target, decision]
-                            ).collect()
+                        session.sql(
+                            "CALL SP_RECORD_SIGNOFF(?, ?)", params=[signoff_target, decision]
+                        ).collect()
                         q.clear()
                         q_params.clear()
                         st.success(f"Recorded: {decision} for {signoff_target}.")
@@ -728,23 +728,29 @@ with tabs[4]:
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
 
-    for msg in st.session_state.chat_messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            for c in msg.get("citations", []):
-                st.caption(f"📄 {c.get('doc_title', c.get('doc_id', 'source'))}")
-
+    # No st.chat_message/st.chat_input/st.rerun below -- confirmed live, 2026-09-17, this
+    # deployed Streamlit-in-Snowflake runtime predates all three (chat elements shipped together
+    # in Streamlit 1.24, st.rerun in 1.27; this runtime's ceiling is below both). The
+    # clear-conversation button is handled *before* the history loop below, in the same script
+    # run, specifically so the cleared state is what the loop sees -- Streamlit already reruns the
+    # whole script on every button click, so no explicit rerun call is needed at all.
     if st.session_state.chat_messages and st.button("Clear conversation"):
         st.session_state.chat_messages = []
-        st.rerun()
 
-    user_prompt = st.chat_input("Ask about trades, obligations, detector findings, or a rule…")
-    if user_prompt:
-        with st.chat_message("user"):
-            st.markdown(user_prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("Querying VIGIL_SURVEILLANCE_AGENT…"):
-                answer, citations = send_chat_message(user_prompt)
-            st.markdown(answer)
-            for c in citations:
-                st.caption(f"📄 {c.get('doc_title', c.get('doc_id', 'source'))}")
+    for msg in st.session_state.chat_messages:
+        role_label = "🧑 You" if msg["role"] == "user" else "🤖 Vigil"
+        st.markdown(f"**{role_label}:**  {msg['content']}")
+        for c in msg.get("citations", []):
+            st.caption(f"📄 {c.get('doc_title', c.get('doc_id', 'source'))}")
+        st.divider()
+
+    with st.form("chat_input_form", clear_on_submit=True):
+        user_prompt = st.text_input("Ask about trades, obligations, detector findings, or a rule…")
+        chat_submitted = st.form_submit_button("Send")
+    if chat_submitted and user_prompt:
+        st.markdown(f"**🧑 You:**  {user_prompt}")
+        with st.spinner("Querying VIGIL_SURVEILLANCE_AGENT…"):
+            answer, citations = send_chat_message(user_prompt)
+        st.markdown(f"**🤖 Vigil:**  {answer}")
+        for c in citations:
+            st.caption(f"📄 {c.get('doc_title', c.get('doc_id', 'source'))}")
